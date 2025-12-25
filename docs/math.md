@@ -5,8 +5,8 @@ This page summarizes the key mathematical formulas and numeric choices used in H
 **MFCC processing**
 - Sampling rate: $\mathrm{sr}=16000$ (from `config/base.yaml`).
 - Window / FFT sizes (seconds → samples):
-  - Frame length $L_s = \text{frame_length_s}$ → $N_{fft} = \lfloor L_s \cdot sr \rceil$ (example: $0.032\,s \times 16000 = 512$ samples).
-  - Hop length $H_s = \text{hop_length_s}$ → $H = \lfloor H_s \cdot sr \rceil$ (example: $0.016\,s \times 16000 = 256$ samples).
+  - Frame length $L_s = \text{frame\_length\_s}$ → $N_{fft} = \lfloor L_s \cdot sr \rceil$ (example: $0.032\,s \times 16000 = 512$ samples).
+  - Hop length $H_s = \text{hop\_length\_s}$ → $H = \lfloor H_s \cdot sr \rceil$ (example: $0.016\,s \times 16000 = 256$ samples).
 - MFCC matrix shape: time-steps × `n_mfcc` (project defaults use `n_mfcc=28`). `extract_mfcc.py` returns `(y, mfcc.T)` so frames are rows.
 
 **Temporal Convolutional Network (TCN)**
