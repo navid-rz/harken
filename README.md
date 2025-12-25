@@ -1,4 +1,7 @@
-harken is a hobby project to implement and study temporal convolutional network for keyword spotting, and specifically integrate analog hardware implementation system modeling.
+harken is a hobby project to implement and study temporal convolutional networks in pytorch for keyword spotting and integrate analog hardware system modeling elements for inference,
+to keep track of high level metrics such as latency and power consumption.
+
+Training is done in digital domain entirely. The analog hardware model is only intended for inference.
 
 Specific points of interest:
 - Limits of quantization of weights and activations for extreme low reslution compute systems.
