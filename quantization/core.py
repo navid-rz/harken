@@ -1,3 +1,5 @@
+# Added from analysis/plot_weights.py
+
 import torch
 import numpy as np
 from typing import Dict, Any, Optional
@@ -200,3 +202,20 @@ def quantize_model_weights(
                     q = torch.clamp(torch.round(w / scale + zero_point), qmin, qmax_w)
                     module.weight.data = (q - zero_point) * scale
     return model
+
+def quantize_state_dict_to_codes(
+    state_dict: Dict[str, torch.Tensor],
+    bits: int,
+    scheme: str = "per_channel",
+    global_percentile: float = 100.0,
+) -> np.ndarray:
+    """
+    Quantize all .weight tensors and return concatenated integer codes.
+    Supports: per_channel, per_tensor, global
+    """
+    if scheme == "global":
+        return quantize_weights_global(state_dict, bits, global_percentile)
+    elif scheme == "per_channel":
+        return quantize_weights_per_channel(state_dict, bits, ch_axis=0)
+    else:  # per_tensor
+        return quantize_weights_per_tensor(state_dict, bits)

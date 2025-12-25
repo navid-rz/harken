@@ -5,6 +5,7 @@ Heuristic: treats each high‑level temporal block as one box, plus input/output
 Residual edges drawn dashed (blue). If auto detection fails, use --blocks N.
 """
 import argparse, os, torch
+os.environ["PATH"] += os.pathsep + r"C:\Program Files\Graphviz\bin"
 from train.train import load_config
 from train.utils import build_model_from_cfg, load_state_dict_forgiving
 from data_loader.utils import make_datasets, get_num_classes
@@ -41,22 +42,13 @@ def infer_blocks(model):
             ordered.append(c)
     return ordered
 
-def build_sample(cfg):
-    # Minimal sample using MFCC/time dims implicitly taken from dataset
-    # Use train loader first batch
-    train_loader, _, _ = make_datasets(cfg, which="train", batch_size=1)
-    batch = next(iter(train_loader))
-    x = batch[0] if isinstance(batch, (list, tuple)) else batch["x"]
-    return x[0]  # (C,T)
 
 def load_model(cfg_path, weights_path, device):
     cfg = load_config(cfg_path)
-    sample = build_sample(cfg)
-    num_classes = get_num_classes(cfg)
-    model = build_model_from_cfg(cfg, sample, num_classes)
+    model = build_model_from_cfg(cfg)
     model = load_state_dict_forgiving(model, weights_path, device)
     model.to(device).eval()
-    return model, sample.unsqueeze(0)
+    return model
 
 def make_block_diagram(model, out_svg, forced_blocks=None):
     if Digraph is None:
@@ -126,7 +118,7 @@ def main():
     out_base = os.path.join("plots", args.outdir.lstrip("/\\"))
     os.makedirs(out_base, exist_ok=True)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model, sample = load_model(args.config, args.weights, device)
+    model = load_model(args.config, args.weights, device)
     make_block_diagram(model, os.path.join(out_base, "diagram_blocks"), forced_blocks=args.blocks)
 
 if __name__ == "__main__":

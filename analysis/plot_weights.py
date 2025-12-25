@@ -24,43 +24,54 @@ import numpy as np
 import matplotlib.pyplot as plt
 from copy import deepcopy
 
-import yaml
-from model.model import DilatedTCN
-from data_loader.mfcc_dataset import MFCCDataset
+from train.utils import build_model_from_cfg, load_config, deep_update
 from quantization.core import (
-    quantize_weights_global,
-    quantize_weights_per_tensor,
-    quantize_weights_per_channel,
+    quantize_state_dict_to_codes,
     qmax_for_bits
 )
 
 
-
-def deep_update(dst, src):
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            deep_update(dst[k], v)
-        else:
-            dst[k] = v
-    return dst
-
-
-def load_config(path):
-    def _load_yaml(path):
-        for enc in ("utf-8", "utf-8-sig", "cp1252"):
-            try:
-                with open(path, "r", encoding=enc) as f:
-                    return yaml.safe_load(f)
-            except UnicodeDecodeError:
-                continue
-        raise UnicodeDecodeError(f"Cannot decode: {path}")
-
-    cfg_task = _load_yaml(path)
-    base_path = os.path.join(os.path.dirname(path), "base.yaml")
-    if os.path.basename(path) != "base.yaml" and os.path.exists(base_path):
-        cfg_base = _load_yaml(base_path)
-        return deep_update(deepcopy(cfg_base), cfg_task)
-    return cfg_task
+def fold_batchnorm_into_weights(state_dict):
+    """
+    Returns a new state_dict with BatchNorm1d folded into preceding Conv1d/Linear layers.
+    Only supports standard PyTorch naming conventions: <layer>.weight, <layer>.bias, <bn>.weight, <bn>.bias, <bn>.running_mean, <bn>.running_var, <bn>.eps
+    """
+    import copy
+    sd = copy.deepcopy(state_dict)
+    folded = {}
+    keys = list(sd.keys())
+    for k in keys:
+        if not (k.endswith('.weight') and ('.bn' in k or '.batchnorm' in k or '.norm' in k or 'bn' in k.split('.')[-2])):
+            continue
+        # Try to find preceding conv/linear layer
+        parts = k.split('.')
+        if len(parts) < 2:
+            continue
+        prefix = '.'.join(parts[:-1])
+        # Try to find previous layer (same prefix minus last part)
+        parent = '.'.join(parts[:-2])
+        # Try common patterns: block.bn, block.conv, block.linear
+        for cand in ['conv1', 'conv2', 'conv', 'linear', 'fc']:
+            w_key = parent + '.' + cand + '.weight' if parent else cand + '.weight'
+            b_key = parent + '.' + cand + '.bias' if parent else cand + '.bias'
+            if w_key in sd:
+                # Fold BatchNorm into this layer
+                W = sd[w_key].clone()
+                b = sd[b_key].clone() if b_key in sd else torch.zeros(W.shape[0])
+                gamma = sd[k]
+                beta = sd[prefix + '.bias'] if prefix + '.bias' in sd else torch.zeros_like(gamma)
+                mean = sd[prefix + '.running_mean']
+                var = sd[prefix + '.running_var']
+                eps = sd[prefix + '.eps'] if prefix + '.eps' in sd else 1e-5
+                std = (var + eps).sqrt()
+                W_fold = W * (gamma / std).reshape([-1] + [1]*(W.dim()-1))
+                b_fold = (b - mean) / std * gamma + beta
+                folded[w_key] = W_fold
+                folded[b_key] = b_fold
+    # Update state_dict with folded weights
+    for k, v in folded.items():
+        sd[k] = v
+    return sd
 
 # -----------------------------
 # IO helpers
@@ -150,15 +161,17 @@ def hist_with_counts(
     print(f"[OK] Saved {out_path}")
 
 
-def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: int, zero_threshold: float, show: bool):
-    """Plot a single histogram of all floating-point tensors combined (weights + biases), with counts."""
+def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: int, zero_threshold: float, show: bool, suffix: str = ""):
+    """Plot a single histogram of all floating-point .weight tensors (no biases), with counts."""
     ensure_dir(outdir)
     values = []
     for k, v in state_dict.items():
+        if not k.endswith('.weight'):
+            continue
         if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
             values.append(v.detach().cpu().numpy().ravel())
     if not values:
-        print("[WARN] No floating-point tensors found in state_dict.")
+        print("[WARN] No floating-point .weight tensors found in state_dict.")
         return
 
     arr = np.concatenate(values, axis=0)
@@ -166,7 +179,7 @@ def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: in
 
     plt.figure(figsize=(9, 5))
     plt.hist(arr, bins=bins)
-    plt.title("All weights/biases histogram (float)")
+    plt.title(f"All weights histogram (float){suffix}")
     plt.xlabel("value")
     plt.ylabel("count")
     plt.grid(True, axis="y", alpha=0.3)
@@ -183,7 +196,7 @@ def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: in
         bbox=dict(facecolor="white", alpha=0.8, edgecolor="none")
     )
 
-    out_path = os.path.join(outdir, "all_weights_hist.png")
+    out_path = os.path.join(outdir, f"all_weights_hist{suffix}.png")
     plt.savefig(out_path, bbox_inches="tight")
     if show:
         plt.show()
@@ -209,103 +222,6 @@ def collect_weight_arrays(state_dict: Dict[str, torch.Tensor]) -> List[np.ndarra
     return arrs
 
 
-
-# -----------------------------
-# Quantization helpers (codes & dequant)
-# -----------------------------
-def qmax_for_bits(bits: int) -> int:
-    return (1 << (bits - 1)) - 1  # 2^(b-1)-1, symmetric signed
-
-
-def quantize_codes_per_tensor(w: torch.Tensor, bits: int) -> Tuple[np.ndarray, float]:
-    """
-    Return integer codes q (flattened) and scale for per-tensor symmetric quantization.
-    q ∈ [-qmax, qmax], dequant approx: w ≈ q * scale
-    """
-    qmax = qmax_for_bits(bits)
-    with torch.no_grad():
-        max_abs = w.abs().max()
-        if max_abs == 0:
-            q = torch.zeros_like(w)
-            return q.view(-1).cpu().numpy(), 1.0
-        scale = (max_abs / qmax).item()
-        q = torch.round(w / scale).clamp_(-qmax, qmax)
-        return q.view(-1).cpu().numpy(), scale
-
-
-def quantize_codes_per_channel(w: torch.Tensor, bits: int, ch_axis: int = 0) -> np.ndarray:
-    """
-    Return concatenated integer codes for per-output-channel symmetric quantization.
-      Conv1d weight: (C_out, C_in, K)  -> ch_axis=0
-      Linear weight: (C_out, C_in)     -> ch_axis=0
-    We only need q codes for histogram; scale differs per channel.
-    """
-    if w.ndim not in (2, 3):
-        # fallback to per-tensor for unexpected shapes
-        q_codes, _ = quantize_codes_per_tensor(w, bits)
-        return q_codes
-
-    qmax = qmax_for_bits(bits)
-    with torch.no_grad():
-        # Move the channel axis to front (already 0, but keep generic)
-        perm = list(range(w.ndim))
-        perm[0], perm[ch_axis] = perm[ch_axis], perm[0]
-        w_perm = w.permute(*perm).contiguous()   # (C, ...)
-        C = w_perm.shape[0]
-        rest = w_perm.view(C, -1)
-        max_abs = rest.abs().max(dim=1).values   # (C,)
-
-        # Avoid div-by-zero: channels with all-zeros get scale=1 and q=0
-        scale = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs / qmax)  # (C,)
-        q = torch.round(rest / scale.unsqueeze(1)).clamp_(-qmax, qmax)
-        return q.view(-1).cpu().numpy()
-
-
-def quantize_codes_global(state_dict: Dict[str, torch.Tensor], bits: int, global_percentile: float = 100.0) -> np.ndarray:
-    """
-    Quantize all .weight tensors using a single global scale (symmetric).
-    The scale is set by the given percentile of absolute weights.
-    Returns concatenated integer codes.
-    """
-    weights = []
-    for name, t in state_dict.items():
-        if not isinstance(t, torch.Tensor):
-            continue
-        if not t.dtype.is_floating_point:
-            continue
-        if not name.endswith(".weight"):
-            continue
-        weights.append(t.detach().cpu().numpy().ravel())
-    if not weights:
-        print("[WARN] No weight tensors found for global quantization.")
-        return np.array([], dtype=np.float32)
-    all_weights = np.concatenate(weights, axis=0)
-    qmax = qmax_for_bits(bits)
-    max_abs = np.percentile(np.abs(all_weights), global_percentile)
-    if max_abs == 0:
-        q = np.zeros_like(all_weights)
-        return q
-    scale = max_abs / qmax
-    q = np.round(all_weights / scale).clip(-qmax, qmax)
-    return q.astype(np.int32)
-
-
-def quantize_state_dict_to_codes(
-    state_dict: Dict[str, torch.Tensor],
-    bits: int,
-    scheme: str = "per_channel",
-    global_percentile: float = 100.0,
-) -> np.ndarray:
-    """
-    Quantize all .weight tensors and return concatenated integer codes.
-    Supports: per_channel, per_tensor, global
-    """
-    if scheme == "global":
-        return quantize_weights_global(state_dict, bits, global_percentile)
-    elif scheme == "per_channel":
-        return quantize_weights_per_channel(state_dict, bits, ch_axis=0)
-    else:  # per_tensor
-        return quantize_weights_per_tensor(state_dict, bits)
 
 # -----------------------------
 # Multi-quant figure (integer-code hist for quantized variants)
@@ -467,6 +383,8 @@ def parse_bits_list(bits_str: str) -> List[int]:
 
 
 def main():
+    # --- Print all bias parameters with summary ---
+    
     parser = argparse.ArgumentParser(description="Visualize model weights with histograms and multi-quant (aligned bins).")
     parser.add_argument("--weights", type=str, required=True, help="Path to .pt (state_dict or checkpoint).")
     parser.add_argument("--outdir", type=str, default="plots/weights_viz", help="Directory to save figures.")
@@ -494,11 +412,28 @@ def main():
         if isinstance(v, torch.Tensor):
             print(f"{k:<40} {tuple(v.shape)}")
 
+    print("\n[BIAS PARAMETERS]")
+    for k, v in sd.items():
+        if k.endswith('.bias') and isinstance(v, torch.Tensor):
+            arr = v.detach().cpu().numpy().ravel()
+            print(f"{k:<40} shape={arr.shape} min={arr.min():.4g} max={arr.max():.4g} mean={arr.mean():.4g} sample={arr[:5]}")
+
+    # --- Print summary of all tensors ---
+    print("\n[CHECKPOINT TENSOR SUMMARY]")
+    for k, v in sd.items():
+        if isinstance(v, torch.Tensor):
+            arr = v.detach().cpu().numpy().ravel()
+            dtype = v.dtype
+            print(f"{k:<40} shape={v.shape} dtype={dtype} min={arr.min():.4g} max={arr.max():.4g} mean={arr.mean():.4g} sample={arr[:5]}")
+        else:
+            print(f"{k:<40} type={type(v)}")
+
     # --- Detect quantized weights ---
     has_quantized = any(
         isinstance(t, torch.Tensor) and t.dtype in (torch.qint8, torch.quint8, torch.int8, torch.uint8)
         for t in sd.values()
     )
+
 
     if has_quantized:
         print("[INFO] Detected quantized weights. Plotting actual quantized histograms only.")
@@ -510,11 +445,45 @@ def main():
             if isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
                 print(f"[INFO] Floating-point dtype: {v.dtype}")
                 break
+
+        # --- Print min/max of all_weights (unfolded) ---
+        all_weights = []
+        for k, v in sd.items():
+            if k.endswith('.weight') and isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+                all_weights.append(v.detach().cpu().numpy().ravel())
+        if all_weights:
+            all_weights_arr = np.concatenate(all_weights, axis=0)
+            print(f"[ALL WEIGHTS] min={all_weights_arr.min():.6g} max={all_weights_arr.max():.6g}")
+        else:
+            all_weights_arr = None
+
         overall_histogram(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
+
+        # --- Print min/max of all_weights_folded ---
+        sd_folded = fold_batchnorm_into_weights(sd)
+        all_weights_folded = []
+        for k, v in sd_folded.items():
+            if k.endswith('.weight') and isinstance(v, torch.Tensor) and v.dtype.is_floating_point:
+                all_weights_folded.append(v.detach().cpu().numpy().ravel())
+        if all_weights_folded:
+            all_weights_folded_arr = np.concatenate(all_weights_folded, axis=0)
+            print(f"[ALL WEIGHTS FOLDED] min={all_weights_folded_arr.min():.6g} max={all_weights_folded_arr.max():.6g}")
+        else:
+            all_weights_folded_arr = None
+
+        overall_histogram(sd_folded, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show, suffix="_folded")
+
         if args.per_layer:
             plot_per_layer_histograms(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
+
         bits_list = parse_bits_list(args.quant_bits)
         if bits_list:
+            for b in bits_list:
+                q_codes = quantize_state_dict_to_codes(sd, bits=b, scheme=args.quant_scheme, global_percentile=args.global_percentile)
+                if q_codes.size > 0:
+                    print(f"[QUANTIZED {b}-bit {args.quant_scheme}] min={q_codes.min()} max={q_codes.max()}")
+                else:
+                    print(f"[QUANTIZED {b}-bit {args.quant_scheme}] No quantized codes found.")
             plot_multi_quant_histograms(
                 state_dict=sd,
                 outdir=args.outdir,

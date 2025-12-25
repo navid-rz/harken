@@ -44,12 +44,12 @@ model:
   # Convolutional block options
   causal: true                      # causal padding + right-trim
   activation: relu                  # relu | gelu | prelu
-  norm: none                       # batch | group | layer | none
+  norm: batch                       # batch | group | layer | none
   groups_for_groupnorm: 8           # only used when norm=group
   use_weight_norm: false            # apply weight_norm to convs
-  depthwise_separable: false       # use depthwise+pointwise convs
+  depthwise_separable: false        # use depthwise+pointwise convs
   pool: avg                         # avg | max (global pool over time)
-  bias: false                        # include bias in conv layers
+  bias: false                       # include bias in conv layers
 
 train:
   batch_size: 32

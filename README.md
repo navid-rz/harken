@@ -1,6 +1,12 @@
-# tcn_kws
-machines can hear us
-tcn_kws_scratch/
+harken is a hobby project to implement and study temporal convolutional network for keyword spotting, and specifically integrate analog hardware implementation system modeling.
+
+Specific points of interest:
+- Limits of quantization of weights and activations for extreme low reslution compute systems.
+- Effects of noise, non-linearity and error in analog implementation
+- Modeling high level HW system benchmarks such as latency, speed and power consumption. 
+
+
+Project tree
 ├── README.md               # Project overview and instructions
 ├── requirements.txt        # Python dependencies
 ├── data/
