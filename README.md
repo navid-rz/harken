@@ -1,3 +1,7 @@
+-<p align="center">
+	<img src="docs/logo.png" alt="harken logo" width="200"/>
+</p>
+
 harken is a hobby project to implement and study temporal convolutional networks in pytorch for keyword spotting and integrate analog hardware system modeling elements for inference,
 to keep track of high level metrics such as latency and power consumption.
 
