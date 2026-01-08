@@ -32,3 +32,6 @@ Project tree
 │   └── test_layers.py      # Unit tests for model components
 └── venv/                   # Virtual environment (not pushed to GitHub)
 
+<p align="center">
+  <img src="plots/activations_time_animation.gif" alt="activations animation" />
+</p>
