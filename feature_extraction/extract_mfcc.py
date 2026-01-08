@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import os
 from tqdm import tqdm
+from typing import Optional
 
 
 def extract_mfcc(filepath, sr=16000, n_mfcc=16, frame_length=0.02, hop_length=0.01, center=True):
@@ -32,7 +33,7 @@ def extract_mfcc(filepath, sr=16000, n_mfcc=16, frame_length=0.02, hop_length=0.
     return y, mfcc.T
 
 
-def plot_mfcc_and_waveform(y, mfcc, sr=16000, hop_length=0.01):
+def plot_mfcc_and_waveform(y, mfcc, sr=16000, hop_length=0.01, word: Optional[str] = None):
     """
     Plot waveform and MFCC side-by-side.
     
@@ -47,7 +48,7 @@ def plot_mfcc_and_waveform(y, mfcc, sr=16000, hop_length=0.01):
     # Plot waveform
     t = np.linspace(0, len(y) / sr, num=len(y))
     axs[0].plot(t, y)
-    axs[0].set_title("Waveform")
+    axs[0].set_title(f"Waveform" + (f" — {word}" if word else ""))
     axs[0].set_xlabel("Time [s]")
     axs[0].set_ylabel("Amplitude")
 
@@ -57,7 +58,7 @@ def plot_mfcc_and_waveform(y, mfcc, sr=16000, hop_length=0.01):
         extent=[0, mfcc.shape[0]*hop_length, 0, mfcc.shape[1]],
         cmap='viridis'
     )
-    axs[1].set_title("MFCC")
+    axs[1].set_title(f"MFCC" + (f" — {word}" if word else ""))
     axs[1].set_xlabel("Time [s]")
     axs[1].set_ylabel("MFCC Coefficients")
     fig.colorbar(im, ax=axs[1], format="%+2.0f dB")
@@ -75,4 +76,5 @@ if __name__ == "__main__":
         print(f"Sample file not found: {sample_file}")
     else:
         y, mfcc = extract_mfcc(sample_file)
-        plot_mfcc_and_waveform(y, mfcc)
+        word = os.path.basename(os.path.dirname(sample_file))
+        plot_mfcc_and_waveform(y, mfcc, word=word)

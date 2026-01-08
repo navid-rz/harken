@@ -33,5 +33,5 @@ Project tree
 └── venv/                   # Virtual environment (not pushed to GitHub)
 
 <p align="center">
-  <img src="plots/activations_time_animation.gif" alt="activations animation" />
+  <img src="docs/activations_time_animation.gif" alt="activations animation" />
 </p>
