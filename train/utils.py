@@ -10,84 +10,154 @@ from typing import Any, Dict, Optional, Tuple, List, Union, TypeVar
 M = TypeVar("M", bound=nn.Module)
 
 # -----------------------
-# Model building
-# -----------------------
-
-def build_model_from_cfg(cfg: Dict[str, Any]) -> DilatedTCN:
-    """
-    Build DilatedTCN from config.
-    Uses input_channels from cfg['data']['mfcc']['n_mfcc'], num_classes from cfg['task'].
-    """
-    m = cfg["model"]
-    t = cfg["task"]
-    mfcc = cfg["data"]["mfcc"]
-
-    input_channels = int(mfcc["n_mfcc"])
-    kernel_size = int(m["kernel_size"])
-    hidden_channels = int(m["hidden_channels"])
-    dropout = float(m["dropout"])
-    num_blocks = int(m["num_blocks"])
-    causal = bool(m.get("causal", True))
-    activation = str(m.get("activation", "relu"))
-    norm = str(m.get("norm", "batch"))
-    groups_for_groupnorm = int(m.get("groups_for_groupnorm", 8))
-    use_weight_norm = bool(m.get("use_weight_norm", False))
-    depthwise_separable = bool(m.get("depthwise_separable", False))
-    pool = str(m.get("pool", "avg"))
-    bias = bool(m.get("bias", True))
-
-    # Get num_classes from task config
-    class_list = t.get("class_list", [])
-    include_unknown = bool(t.get("include_unknown", False))
-    include_background = bool(t.get("include_background", False))
-    num_classes = len(class_list)
-    if include_unknown:
-        num_classes += 1
-    if include_background:
-        num_classes += 1
-
-    model = DilatedTCN(
-        input_channels=input_channels,
-        num_blocks=num_blocks,
-        hidden_channels=hidden_channels,
-        kernel_size=kernel_size,
-        num_classes=num_classes,
-        dropout=dropout,
-        causal=causal,
-        activation=activation,
-        norm=norm,
-        groups_for_groupnorm=groups_for_groupnorm,
-        use_weight_norm=use_weight_norm,
-        depthwise_separable=depthwise_separable,
-        pool=pool,
-        bias=bias,
-    )
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(
-        "[MODEL] DilatedTCN built: "
-        f"in_ch={input_channels}, hidden={hidden_channels}, "
-        f"kernel={kernel_size}, blocks={num_blocks}, dropout={dropout}, classes={num_classes}, "
-        f"causal={causal}, act={activation}, norm={norm}, groups={groups_for_groupnorm}, "
-        f"dwise_sep={depthwise_separable}, w_norm={use_weight_norm}, pool={pool}, bias={bias}"
-    )
-    print(f"[PARAMS] total={total_params:,} trainable={trainable_params:,}")
-
-    return model
-
-# -----------------------
 # Loading weights
 # -----------------------
-def load_state_dict_forgiving(model: M, path: str, device: torch.device) -> M:
-    state_dict = torch.load(path, map_location=device)
-    model_state = model.state_dict()
+def load_state_dict(path: str) -> Dict[str, torch.Tensor]:
+    """
+    Load a state_dict from a .pt file. Supports:
+      - raw state_dict (param_name -> tensor)
+      - checkpoint dict with "model" key
+      - checkpoint dict with "state_dict" key
+    """
+    obj = torch.load(path, map_location="cpu")
+    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        print("[INFO] Detected wrapper with 'state_dict' key.")
+        return obj["state_dict"]
+    if isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
+        print("[INFO] Detected checkpoint with 'model' key.")
+        return obj["model"]
+    if isinstance(obj, dict):
+        print("[INFO] Detected raw state_dict.")
+        return obj
+    raise ValueError("Unsupported weights file format: expected a state_dict or checkpoint dict.")
 
+
+def load_state_dict_forgiving(model: M, path: str, device: torch.device) -> M:
+    # Use load_state_dict to handle checkpoint wrappers (state_dict/model keys)
+    obj = torch.load(path, map_location=device)
+    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+        state_dict = obj["state_dict"]
+    elif isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
+        state_dict = obj["model"]
+    elif isinstance(obj, dict):
+        state_dict = obj
+    else:
+        raise ValueError("Unsupported weights file format: expected a state_dict or checkpoint dict.")
+    
+    model_state = model.state_dict()
     filtered = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
     model_state.update(filtered)
     model.load_state_dict(model_state)
     print(f"[INFO] Loaded weights (forgiving): matched {len(filtered)}/{len(model_state)} tensors")
     return model
+
+
+# -----------------------
+# BatchNorm Folding
+# -----------------------
+def fold_batchnorm(model: nn.Module) -> nn.Module:
+    """
+    Fold BatchNorm1d layers into preceding Conv1d layers.
+    
+    This combines BN parameters (gamma, beta, running_mean, running_var) into
+    the Conv weights and biases, then replaces BN with Identity. This is essential
+    for hardware deployment and before QAT to match the paper's approach.
+    
+    Only works with BatchNorm1d. GroupNorm and LayerNorm cannot be folded.
+    
+    Args:
+        model: PyTorch model with Conv1d → BatchNorm1d patterns
+    
+    Returns:
+        Modified model with BN folded into Conv layers
+    """
+    model.eval()  # Use running stats
+    
+    # Find all Conv → BN patterns in the model
+    modules = list(model.named_modules())
+    folded_count = 0
+    
+    for i, (name, module) in enumerate(modules):
+        if isinstance(module, nn.Conv1d):
+            # Look for BatchNorm1d immediately following this Conv
+            # Check if next module in parent's children is BN
+            parent_name = ".".join(name.split(".")[:-1]) if "." in name else ""
+            conv_attr = name.split(".")[-1]
+            
+            # Get parent module
+            if parent_name:
+                parent = dict(model.named_modules())[parent_name]
+            else:
+                parent = model
+            
+            # Check if there's a BN following this conv in the parent's sequential structure
+            # This is a heuristic - we look for common patterns like conv1 → norm1
+            bn_candidates = []
+            if hasattr(parent, f"{conv_attr[:-1]}orm{conv_attr[-1]}"):  # conv1 → norm1
+                bn_candidates.append(f"{conv_attr[:-1]}orm{conv_attr[-1]}")
+            # Try direct sequence (for nn.Sequential)
+            if hasattr(parent, "__getitem__"):
+                try:
+                    idx = list(parent._modules.keys()).index(conv_attr)
+                    if idx + 1 < len(parent._modules):
+                        next_key = list(parent._modules.keys())[idx + 1]
+                        bn_candidates.append(next_key)
+                except (ValueError, AttributeError):
+                    pass
+            
+            for bn_attr in bn_candidates:
+                if hasattr(parent, bn_attr):
+                    bn = getattr(parent, bn_attr)
+                    if isinstance(bn, nn.BatchNorm1d):
+                        # Fold BN into Conv
+                        conv = module
+                        _fold_bn_into_conv(conv, bn)
+                        # Replace BN with Identity
+                        setattr(parent, bn_attr, nn.Identity())
+                        folded_count += 1
+                        print(f"[BN-FOLD] {name} → {parent_name}.{bn_attr if parent_name else bn_attr}")
+                        break
+    
+    print(f"[OK] Folded {folded_count} BatchNorm layers into Conv layers")
+    return model
+
+
+def _fold_bn_into_conv(conv: nn.Conv1d, bn: nn.BatchNorm1d) -> None:
+    """
+    Fold BatchNorm parameters into Conv1d weights and bias.
+    
+    Math:
+        BN: y = gamma * (x - mean) / sqrt(var + eps) + beta
+        Folded: w_new = w * gamma / sqrt(var + eps)
+                b_new = (b - mean) * gamma / sqrt(var + eps) + beta
+    
+    Args:
+        conv: Conv1d layer to modify in-place
+        bn: BatchNorm1d layer to fold
+    """
+    # Get BN parameters
+    gamma = bn.weight.data
+    beta = bn.bias.data
+    mean = bn.running_mean
+    var = bn.running_var
+    eps = bn.eps
+    
+    # Compute scaling factor: gamma / sqrt(var + eps)
+    std = torch.sqrt(var + eps)
+    scale = gamma / std
+    
+    # Fold into conv weights
+    # Conv weight shape: (out_channels, in_channels, kernel_size)
+    # Scale each output channel
+    conv.weight.data = conv.weight.data * scale.view(-1, 1, 1)
+    
+    # Fold into conv bias
+    if conv.bias is None:
+        # Create bias if it doesn't exist
+        conv.bias = nn.Parameter(torch.zeros(conv.out_channels, device=conv.weight.device))
+    
+    conv.bias.data = (conv.bias.data - mean) * scale + beta
+
 
 # -----------------------
 # Metrics helpers
@@ -158,130 +228,60 @@ def compute_confusion_matrix(model: nn.Module, loader: DataLoader, device: torch
     return cm
 
 
-# -----------------------
-# Config helpers
-# -----------------------
-def deep_update(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            deep_update(dst[k], v)
-        else:
-            dst[k] = v
-    return dst
-
-def _load_yaml_with_encodings(path: str) -> Dict[str, Any]:
-    import yaml
-    # Try UTF-8 first; then UTF-8 with BOM; then cp1252 as last resort.
-    for enc in ("utf-8", "utf-8-sig", "cp1252"):
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return yaml.safe_load(f)
-        except UnicodeDecodeError:
-            continue
-    raise UnicodeDecodeError("yaml", b"", 0, 1, f"Could not decode {path} with utf-8/utf-8-sig/cp1252")
-
-def load_config(path: str) -> Dict[str, Any]:
-    cfg_task = _load_yaml_with_encodings(path)
-
-    # Optional base.yaml merge
-    base_path = os.path.join(os.path.dirname(path), "base.yaml")
-    if os.path.basename(path) != "base.yaml" and os.path.exists(base_path):
-        cfg_base = _load_yaml_with_encodings(base_path)
-        return deep_update(deepcopy(cfg_base), cfg_task)
-    return cfg_task
-
-# -----------------------
-# Weights export
-# -----------------------
-def export_quantized_weights_npz(model: nn.Module, path: str) -> None:
+@torch.no_grad()
+def evaluate_model(
+    model: nn.Module,
+    dataloader: DataLoader,
+    device: torch.device,
+    task_type: str,
+    threshold: float = 0.5,
+    num_classes: Optional[int] = None
+) -> Tuple[float, float, float, float]:
     """
-    Save quantized model weights (int) to a .npz file for inspection or hardware use.
-    Only works for quantized models (e.g., torch.ao.quantized).
-    """
-    if not isinstance(model, torch.nn.Module):
-        raise TypeError("model must be a torch.nn.Module")
-
-    state = model.state_dict()
-    weights = {}
-    for name, tensor in state.items():
-        if isinstance(tensor, torch.Tensor) and tensor.dtype in (torch.qint8, torch.quint8, torch.int8, torch.uint8):
-            weights[name] = tensor.int_repr().cpu().numpy()
-    np.savez(path, **weights)
-    print(f"[OK] Quantized weights saved to {path}")
-
-# -----------------------
-# Float checkpoint -> NPZ integer codes + scales
-# -----------------------
-def export_quant_from_pt(
-    weights_path: str,
-    out_path: str,
-    bits: int = 5,
-    per_channel: bool = True,
-    symmetric: bool = True,
-) -> List[str]:
-    """
-    Quantize raw float weights from a PyTorch checkpoint to integer codes + scales
-    and store them in an NPZ archive (variable shapes supported via object arrays).
-
+    Evaluate model on a dataset and return accuracy, precision, recall, F1.
+    
     Args:
-        weights_path: .pt/.pth checkpoint (either raw state_dict or dict with 'state_dict')
-        out_path: destination .npz path (directories auto-created)
-        bits: quantization bit-width (<=16 recommended)
-        per_channel: per-output-channel scaling (first dim) if True, else per-tensor
-        symmetric: symmetric (signed) if True; otherwise unsigned/asymmetric (0..2^bits-1)
-
+        model: PyTorch model
+        dataloader: DataLoader with (features, labels)
+        device: Device to run evaluation on
+        task_type: 'binary' or 'multiclass'
+        threshold: Classification threshold for binary task
+        num_classes: Number of classes for multiclass task
+    
     Returns:
-        List of tensor names quantized.
+        (accuracy, precision, recall, f1)
     """
-    obj = torch.load(weights_path, map_location="cpu")
-    state = obj["state_dict"] if isinstance(obj, dict) and "state_dict" in obj else obj
-
-    qmax = (1 << (bits - 1)) - 1 if symmetric else (1 << bits) - 1
-    qmin = -qmax if symmetric else 0
-
-    names: List[str] = []
-    q_list: List[np.ndarray] = []
-    scale_list: List[np.ndarray] = []
-
-    for name, w in state.items():
-        if not isinstance(w, torch.Tensor):
-            continue
-        if "weight" not in name:
-            continue
-        if w.ndim < 2:  # skip biases / norms
-            continue
-        wf = w.float().cpu()
-        if per_channel:
-            oc = wf.shape[0]
-            flat = wf.view(oc, -1)
-            if symmetric:
-                max_abs = flat.abs().max(dim=1).values
-            else:
-                max_abs = flat.max(dim=1).values
-            scale = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs / qmax)
-            q = torch.round(flat / scale[:, None]).clamp(qmin, qmax).to(torch.int16)
-            names.append(name)
-            q_list.append(q.numpy())
-            scale_list.append(scale.numpy())
+    model.eval().to(device)
+    total_loss, correct, total, tp, fp, fn = 0.0, 0, 0, 0, 0, 0
+    cm = [[0] * num_classes for _ in range(num_classes)] if task_type == "multiclass" else None
+    criterion = nn.BCEWithLogitsLoss() if task_type == "binary" else nn.CrossEntropyLoss()
+    
+    for x, y in dataloader:
+        x = x.to(device)
+        targets = y.float().unsqueeze(1).to(device) if task_type == "binary" else y.long().to(device)
+        logits = model(x)
+        loss = criterion(logits, targets)
+        total_loss += loss.item()
+        
+        if task_type == "binary":
+            probs = torch.sigmoid(logits)
+            preds = (probs > threshold).long()
+            correct += (preds == targets.long()).sum().item()
+            total += targets.numel()
+            _tp, _fp, _fn, _, _ = _binary_counts(preds, targets)
+            tp += _tp
+            fp += _fp
+            fn += _fn
         else:
-            max_abs = wf.abs().max() if symmetric else wf.max()
-            if max_abs == 0:
-                continue
-            scale = (max_abs / qmax).item()
-            q = torch.round(wf / scale).clamp(qmin, qmax).to(torch.int16)
-            names.append(name)
-            q_list.append(q.numpy())
-            scale_list.append(np.array(scale, dtype=np.float32))
-
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    np.savez(
-        out_path,
-        names=np.array(names, dtype=object),
-        q_list=np.array(q_list, dtype=object),
-        scale_list=np.array(scale_list, dtype=object),
-        bits=np.array(bits),
-        symmetric=np.array(symmetric),
-        per_channel=np.array(per_channel),
-    )
-    print(f"[OK] Quantized {len(names)} tensors -> {out_path}")
-    return names
+            preds = torch.argmax(logits, dim=1)
+            correct += (preds == targets).sum().item()
+            total += targets.numel()
+            cm = _multiclass_confusion_add(cm, preds, targets, num_classes)
+    
+    if task_type == "binary":
+        _, acc, prec, rec, f1 = _derive_metrics(total_loss, len(dataloader), correct, total, tp, fp, fn)
+    else:
+        _, acc = _derive_metrics(total_loss, len(dataloader), correct, total)
+        prec, rec, f1 = _multiclass_macro_prf1(cm)
+    
+    return acc, prec, rec, f1

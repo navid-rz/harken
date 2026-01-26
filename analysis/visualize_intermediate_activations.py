@@ -20,7 +20,9 @@ import matplotlib.animation as animation
 # Set the colormap to use for all plots here:
 cmap = plt.cm.cividis
 
-from train.utils import build_model_from_cfg, load_config, load_state_dict_forgiving
+from config import load_config
+from train.utils import load_state_dict_forgiving
+from model.model import DilatedTCN
 from feature_extraction.extract_mfcc import extract_mfcc
 
 
@@ -526,7 +528,7 @@ if __name__ == "__main__":
 
     # Load config and model
     cfg = load_config(config_path)
-    model = build_model_from_cfg(cfg)
+    model = DilatedTCN.from_config(cfg)
     model = load_state_dict_forgiving(model, weights_path, device=torch.device("cpu"))
     model.eval()
 

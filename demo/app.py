@@ -11,10 +11,12 @@ import torch.nn.functional as F
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import tkinter.font as tkfont
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 
-from train.train import load_config
-from train.utils import build_model_from_cfg, load_state_dict_forgiving
-from data_loader.utils import get_num_classes
+from inference import KeywordModel
 
 # ---------------------------
 # Audio + feature processing
@@ -22,114 +24,10 @@ from data_loader.utils import get_num_classes
 def record_audio(duration_s: float, sr: int) -> np.ndarray:
     rec = sd.rec(int(duration_s * sr), samplerate=sr, channels=1, dtype="float32")
     sd.wait()
-    return rec[:, 0].copy()
-
-def preprocess_wave(y: np.ndarray, sr: int, cfg_mfcc: dict, fixed_duration_s: float) -> torch.Tensor:
-    # Pad / trim to fixed duration
-    target_len = int(fixed_duration_s * sr)
-    if len(y) < target_len:
-        y = np.pad(y, (0, target_len - len(y)))
-    else:
-        y = y[:target_len]
-
-    n_mfcc = int(cfg_mfcc["n_mfcc"])
-    frame_length_s = float(cfg_mfcc["frame_length_s"])
-    hop_length_s   = float(cfg_mfcc["hop_length_s"])
-    n_fft = int(round(frame_length_s * sr))
-    hop_length = int(round(hop_length_s * sr))
-
-    # Librosa MFCC (match training assumptions)
-    mfcc = librosa.feature.mfcc(
-        y=y,
-        sr=sr,
-        n_mfcc=n_mfcc,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        center=True
-    )  # shape (n_mfcc, T)
-
-    # (C, T) float32 tensor
-    feat = torch.from_numpy(mfcc).float()
-    return feat  # (channels, time)
-
-def prepare_input_tensor(feat: torch.Tensor) -> torch.Tensor:
-    # Add batch dim
-    return feat.unsqueeze(0)  # (1, C, T)
-
-# ---------------------------
-# Config helpers
-# ---------------------------
-def get_mfcc_section(cfg: dict) -> dict:
-    """
-    Locate MFCC settings in config. Supports:
-      cfg['mfcc']
-      cfg['data']['mfcc']
-      cfg['features']['mfcc']
-      cfg['audio']['mfcc']
-    """
-    return (
-        cfg.get("mfcc")
-        or cfg.get("data", {}).get("mfcc")
-        or cfg.get("features", {}).get("mfcc")
-        or cfg.get("audio", {}).get("mfcc")
-    )
-
-# ---------------------------
-# Model wrapper
-# ---------------------------
-class KeywordModel:
-    def __init__(self, cfg_path, weights_path, device):
-        self.cfg = load_config(cfg_path)
-        # Find MFCC section (now under data.mfcc in base.yaml)
-        self.mfcc_cfg = get_mfcc_section(self.cfg)
-        if self.mfcc_cfg is None:
-            raise KeyError(
-                "Could not find 'mfcc' section in config. "
-                f"Top-level keys: {list(self.cfg.keys())}"
-            )
-
-        self.device = device
-        self.task_type = self.cfg["task"]["type"]
-        self.class_list = list(self.cfg["task"]["class_list"])
-        if self.cfg["task"].get("include_unknown"):
-            self.class_list.append("unknown")
-        if self.cfg["task"].get("include_background"):
-            self.class_list.append("background")
-        num_classes = len(self.class_list) if self.task_type == "multiclass" else 1
-
-        sr = int(self.mfcc_cfg["sample_rate"])
-        fixed_dur = float(self.mfcc_cfg["fixed_duration_s"])
-        dummy = np.zeros(int(sr * fixed_dur), dtype=np.float32)
-        feat = preprocess_wave(dummy, sr, self.mfcc_cfg, fixed_dur)
-        self.model = build_model_from_cfg(self.cfg)
-        self.model = load_state_dict_forgiving(self.model, weights_path, device)
-        self.model.to(device).eval()
-
-    @torch.no_grad()
-    def predict(self, feat: torch.Tensor, top_k=3):
-        x = prepare_input_tensor(feat).to(self.device)
-        logits = self.model(x)
-        if self.task_type == "multiclass":
-            probs = F.softmax(logits, dim=1)[0]
-            topk = min(top_k, probs.numel())
-            vals, idx = torch.topk(probs, topk)
-            results = [(self.class_list[i], float(vals[j])) for j, i in enumerate(idx)]
-            return results
-        else:
-            prob = torch.sigmoid(logits)[0, 0].item()
-            return [("keyword", prob), ("non_keyword", 1 - prob)]
-
-    @torch.no_grad()
-    def predict_full(self, feat: torch.Tensor):
-        x = prepare_input_tensor(feat).to(self.device)
-        logits = self.model(x)
-        if self.task_type == "multiclass":
-            probs = F.softmax(logits, dim=1)[0]
-            # Return in original class order (for consistent box layout)
-            return [(cls, float(probs[i])) for i, cls in enumerate(self.class_list)]
-        else:
-            prob = torch.sigmoid(logits)[0, 0].item()
-            return [("keyword", prob), ("non_keyword", 1 - prob)]
+    audio = rec[:, 0].copy()
+    # Clip to ensure we're in [-1, 1] range, but preserve natural amplitude variation
+    audio = np.clip(audio, -1.0, 1.0)
+    return audio
 
 # ---------------------------
 # GUI
@@ -138,17 +36,13 @@ class App:
     def __init__(self, root, model: KeywordModel):
         self.root = root
         self.model = model
-        self.cfg = model.cfg
-        self.mfcc_cfg = get_mfcc_section(self.cfg)
-        if self.mfcc_cfg is None:
-            raise KeyError("MFCC config missing (checked: mfcc / data.mfcc / features.mfcc / audio.mfcc).")
-        self.sr = int(self.mfcc_cfg["sample_rate"])
-        self.fixed_duration_s = float(self.mfcc_cfg["fixed_duration_s"])
+        self.sr = model.sr
+        self.fixed_duration_s = model.fixed_duration_s
 
         self.root.title("TCN-KWS")
         self.root.configure(bg="#f3f6fa")
-        # Make window taller for full bar chart visibility
-        self.root.geometry("780x640")
+        # Make window taller for waveform plot
+        self.root.geometry("780x820")
 
         # Styles
         style = ttk.Style()
@@ -240,10 +134,28 @@ class App:
             lbl.grid(row=r, column=c, padx=3, pady=3, sticky="nsew")
             self.class_boxes[cls_name] = lbl
 
+        # ---- Waveform plot ----
+        waveform_frame = ttk.LabelFrame(outer, text="Audio Waveform", style="BG.TLabelframe")
+        waveform_frame.grid(row=4, column=0, columnspan=6, sticky="nsew", pady=(2,6))
+        outer.rowconfigure(4, weight=0)
+        
+        self.waveform_figure = Figure(figsize=(7, 1.5), dpi=80)
+        self.waveform_ax = self.waveform_figure.add_subplot(111)
+        self.waveform_ax.set_ylim(-1.1, 1.1)
+        self.waveform_ax.set_xlabel("Time (s)", fontsize=9)
+        self.waveform_ax.set_ylabel("Amplitude", fontsize=9)
+        self.waveform_ax.tick_params(labelsize=8)
+        self.waveform_ax.grid(True, alpha=0.3)
+        self.waveform_figure.tight_layout()
+        
+        self.waveform_canvas = FigureCanvasTkAgg(self.waveform_figure, master=waveform_frame)
+        self.waveform_canvas.draw()
+        self.waveform_canvas.get_tk_widget().pack(fill="both", expand=True, padx=4, pady=4)
+
         # Shift result + top-k + status rows down
-        result_row = 4
-        topk_row = 5
-        status_row = 6
+        result_row = 5
+        topk_row = 6
+        status_row = 7
 
         ttk.Label(outer, textvariable=self.result_var, style="Result.TLabel").grid(
             row=result_row, column=0, columnspan=6, sticky="w", pady=(2,4)
@@ -297,6 +209,7 @@ class App:
             audio = record_audio(dur, self.sr)
             self.audio_buffer = audio
             self.pred_queue.put(("status", f"Recorded {len(audio)/self.sr:.2f}s"))
+            self.pred_queue.put(("plot_waveform", None))
             self.pred_queue.put(("predict", None))
         except Exception as e:
             self.pred_queue.put(("error", str(e)))
@@ -310,6 +223,7 @@ class App:
         try:
             y, sr = librosa.load(path, sr=self.sr, mono=True)
             self.audio_buffer = y
+            self.plot_waveform()
             self.set_status(f"Loaded: {os.path.basename(path)} ({len(y)/sr:.2f}s)")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load: {e}")
@@ -318,6 +232,7 @@ class App:
         self.audio_buffer = None
         self.result_var.set("Prediction: –")
         self.clear_topk_canvas()
+        self.clear_waveform()
         self.set_status("Cleared buffer.")
 
     def on_predict_loaded(self):
@@ -349,12 +264,40 @@ class App:
         if winner_cls in self.class_boxes:
             self.class_boxes[winner_cls].config(font=self.box_font_bold)
 
+    def plot_waveform(self):
+        """Plot the time-domain audio waveform."""
+        if self.audio_buffer is None:
+            return
+        self.waveform_ax.clear()
+        t = np.arange(len(self.audio_buffer)) / self.sr
+        self.waveform_ax.plot(t, self.audio_buffer, linewidth=0.5, color="#1f77b4")
+        # Auto-scale y-axis with 10% margin
+        y_min, y_max = self.audio_buffer.min(), self.audio_buffer.max()
+        y_range = max(y_max - y_min, 0.01)  # avoid division by zero
+        margin = y_range * 0.1
+        self.waveform_ax.set_ylim(y_min - margin, y_max + margin)
+        self.waveform_ax.set_xlim(0, max(t))
+        self.waveform_ax.set_xlabel("Time (s)", fontsize=9)
+        self.waveform_ax.set_ylabel("Amplitude", fontsize=9)
+        self.waveform_ax.tick_params(labelsize=8)
+        self.waveform_ax.grid(True, alpha=0.3)
+        self.waveform_figure.tight_layout()
+        self.waveform_canvas.draw()
+
+    def clear_waveform(self):
+        """Clear the waveform plot."""
+        self.waveform_ax.clear()
+        self.waveform_ax.set_ylim(-1.1, 1.1)
+        self.waveform_ax.set_xlabel("Time (s)", fontsize=9)
+        self.waveform_ax.set_ylabel("Amplitude", fontsize=9)
+        self.waveform_ax.tick_params(labelsize=8)
+        self.waveform_ax.grid(True, alpha=0.3)
+        self.waveform_figure.tight_layout()
+        self.waveform_canvas.draw()
+
     def predict_current(self):
         try:
-            feat = preprocess_wave(
-                self.audio_buffer, self.sr,
-                self.mfcc_cfg, self.fixed_duration_s
-            )
+            feat = self.model.preprocess(self.audio_buffer)
             full = self.model.predict_full(feat)
             self.update_results(full)  # also triggers bar draw
             self.shade_class_boxes(full)
@@ -451,6 +394,8 @@ class App:
                 kind, payload = self.pred_queue.get_nowait()
                 if kind == "status":
                     self.set_status(payload)
+                elif kind == "plot_waveform":
+                    self.plot_waveform()
                 elif kind == "predict":
                     self.set_status("Predicting...")
                     self.predict_current()

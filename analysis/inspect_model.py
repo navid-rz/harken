@@ -9,7 +9,8 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from train.utils import load_config, build_model_from_cfg
+from config import load_config
+from model.model import DilatedTCN
 from model.model import DilatedTCN
 
 
@@ -93,7 +94,7 @@ def main():
             C, T = _infer_mfcc_shape(cfg)
 
     # Build model using shared factory
-    model = build_model_from_cfg(cfg).to(device)
+    model = DilatedTCN.from_config(cfg).to(device)
     model.eval()
 
     # --- Optional safety patch: auto-trim input time steps on residual mismatch (inspection only) ---

@@ -5,7 +5,7 @@ This file summarizes the training pipeline implemented in `train/train.py` and t
 Pipeline summary
 - Data loading: `data_loader.utils.make_datasets` creates train/val/test splits from `data/preprocessed` using `data.val_split` and `data.test_split`.
 - Augmentation: controlled by `augmentation.enable`; when on an `MFCCAugment` transform applies random time shifts and noise during training.
-- Model build: `build_model_from_cfg(cfg)` constructs `DilatedTCN` using fields from `config.base.yaml` `model` section (channels, kernel size, num_blocks, dropout, causal, etc.).
+- Model build: `DilatedTCN.from_config(cfg)` constructs `DilatedTCN` using fields from `config/base.yaml` `model` section (channels, kernel size, num_blocks, dropout, causal, etc.).
 - Optimizer: Adam with `train.learning_rate` and `train.weight_decay` defaults (see `config/base.yaml`).
 - Loss:
   - Binary tasks: `BCEWithLogitsLoss`, optionally with `pos_weight`.

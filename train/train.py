@@ -16,9 +16,9 @@ import csv
 from train.utils import (
     _binary_counts, _derive_metrics, _multiclass_confusion_add,
     _multiclass_macro_prf1, compute_confusion_matrix,
-    load_config, 
-    build_model_from_cfg,
 )
+from config import load_config
+from model.model import DilatedTCN
 
 from data_loader.utils import make_datasets, TransformDataset, MFCCAugment
 from analysis.plot_metrics import plot_metrics, plot_test_confusion_matrix
@@ -109,7 +109,7 @@ class Trainer:
             sample_x = sample_x[0]
         C, T = int(sample_x.shape[0]), int(sample_x.shape[1])
         print(f"[MFCC dims] channels(C)={C}  timesteps(T)={T}")
-        self.model = build_model_from_cfg(cfg).to(self.device)
+        self.model = DilatedTCN.from_config(cfg).to(self.device)
         self.input_shape = (C, T)  # save for checkpoint metadata
 
         # Optimizer

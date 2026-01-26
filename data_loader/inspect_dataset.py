@@ -8,7 +8,7 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from train.utils import load_config  # noqa: E402
+from config import load_config  # noqa: E402
 from data_loader.utils import make_datasets  # noqa: E402
 
 

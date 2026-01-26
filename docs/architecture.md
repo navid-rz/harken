@@ -17,13 +17,13 @@ Simple diagram (data → model → output):
 
 data/preprocessed (MFCCs)
     ↓ (DataLoader / augmentation)
-    → `train.Trainer` builds model via `build_model_from_cfg(cfg)`
+    → `train.Trainer` builds model via `DilatedTCN.from_config(cfg)`
     → `model.DilatedTCN` (N, C, T) → global pool → `fc` → logits
     ↓
   optimizer / loss → training loop → `checkpoints/` and `plots/`
 
 Where code hooks live:
-- Model builder: `train.utils.build_model_from_cfg` reads `config/base.yaml` `model` block.
+- Model builder: `DilatedTCN.from_config` reads `config/base.yaml` `model` block.
 - Datasets: `data_loader.utils.make_datasets` sets up splits, transforms, and `MFCCAugment` when enabled.
 - Quantization/export: `quantization.core.quantize_model_weights` and `quantize_state_dict_to_codes`.
 

@@ -11,10 +11,12 @@ from typing import Optional, Tuple, List, Dict, Any, Union
 from torch.utils.data import DataLoader
 
 from train.utils import (
-    build_model_from_cfg, load_config, _binary_counts, _derive_metrics,
+    _binary_counts, _derive_metrics,
     _multiclass_confusion_add, _multiclass_macro_prf1, export_quantized_weights_npz,
-    load_state_dict_forgiving,
+    load_state_dict_forgiving, fold_batchnorm,
 )
+from config import load_config
+from model.model import DilatedTCN
 from data_loader.utils import make_datasets, get_num_classes
 from analysis.plot_metrics import plot_metrics, plot_test_confusion_matrix
 
@@ -690,10 +692,16 @@ def main() -> None:
     else:
         x0 = batch0
     sample_x = x0[0] if hasattr(x0, "dim") and x0.dim() == 3 else x0  # (C,T)
-    model = build_model_from_cfg(cfg, sample_x, num_classes)
+    model = DilatedTCN.from_config(cfg)
 
     if args.weights:
         model = load_state_dict_forgiving(model, args.weights, device)
+
+    # Fold BatchNorm before QAT (as per paper: "batch normalization layers folded into the weights")
+    fold_bn = bool(qat_cfg.get("fold_batchnorm", True))
+    if fold_bn:
+        print("[QAT] Folding BatchNorm layers into Conv weights...")
+        model = fold_batchnorm(model)
 
     model.to(device)
     # Apply QAT with per-channel/per-tensor observers during warmup

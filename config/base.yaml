@@ -8,13 +8,15 @@ data:
   # where raw audio lives
   raw_dir: "data/speech_commands_v0.02"
 
-  # MFCC/feature extraction settings
-  mfcc:
+  # feature extraction settings
+  features:
+    type: log-mel              # mfcc | log-mel
     sample_rate: 16000         # sr
-    n_mfcc: 28
-    frame_length_s: 0.032       # seconds
-    hop_length_s: 0.016         # seconds
-    fixed_duration_s: 1.024      # seconds (pad/truncate)
+    n_features: 40             # 16-28 for mfcc, 40-80 for log-mel
+    frame_length_s: 0.032      # seconds
+    hop_length_s: 0.016        # seconds
+    fixed_duration_s: 1.024    # seconds (pad/truncate)
+    normalize: false           # normalize to fixed range (required for hardware deployment with fixed scales)
 
 augmentation:
   enable: true               # turn off by setting false
@@ -44,7 +46,7 @@ model:
   # Convolutional block options
   causal: true                      # causal padding + right-trim
   activation: relu                  # relu | gelu | prelu
-  norm: batch                       # batch | group | layer | none
+  norm: none                       # batch | group | layer | none
   groups_for_groupnorm: 8           # only used when norm=group
   use_weight_norm: false            # apply weight_norm to convs
   depthwise_separable: false        # use depthwise+pointwise convs

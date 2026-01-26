@@ -1,6 +1,8 @@
 import torch
 import numpy as np
-from train.utils import build_model_from_cfg, load_config, load_state_dict_forgiving
+from config import load_config
+from train.utils import load_state_dict_forgiving
+from model.model import DilatedTCN
 from model.model import DilatedTCN
 
 # --- Config and paths ---
@@ -10,7 +12,7 @@ mfcc_npy_file = "data/preprocessed/yes/0a7c2a8d_nohash_0.npy"  # Same as in visu
 
 # Load config and model
 cfg = load_config(config_path)
-model = build_model_from_cfg(cfg)
+model = DilatedTCN.from_config(cfg)
 model = load_state_dict_forgiving(model, weights_path, device=torch.device("cpu"))
 model.eval()
 

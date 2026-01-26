@@ -37,11 +37,7 @@ def summarize_tensor(tensor: torch.Tensor) -> dict:
         "unique_values": uniq,
     }
 
-def load_state_dict(weights_path: str) -> dict:
-    ckpt = torch.load(weights_path, map_location="cpu")
-    if isinstance(ckpt, dict) and "state_dict" in ckpt:
-        return ckpt["state_dict"]
-    return ckpt  # assume plain state_dict
+from train.utils import load_state_dict
 
 def main():
     ap = argparse.ArgumentParser(description="Export model weights to CSV files and write a summary CSV.")

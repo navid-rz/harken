@@ -6,8 +6,9 @@ Residual edges drawn dashed (blue). If auto detection fails, use --blocks N.
 """
 import argparse, os, torch
 os.environ["PATH"] += os.pathsep + r"C:\Program Files\Graphviz\bin"
-from train.train import load_config
-from train.utils import build_model_from_cfg, load_state_dict_forgiving
+from config import load_config
+from train.utils import load_state_dict_forgiving
+from model.model import DilatedTCN
 from data_loader.utils import make_datasets, get_num_classes
 
 try:
@@ -45,7 +46,7 @@ def infer_blocks(model):
 
 def load_model(cfg_path, weights_path, device):
     cfg = load_config(cfg_path)
-    model = build_model_from_cfg(cfg)
+    model = DilatedTCN.from_config(cfg)
     model = load_state_dict_forgiving(model, weights_path, device)
     model.to(device).eval()
     return model

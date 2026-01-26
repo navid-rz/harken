@@ -24,11 +24,11 @@ import numpy as np
 import matplotlib.pyplot as plt
 from copy import deepcopy
 
-from train.utils import build_model_from_cfg, load_config, deep_update
 from quantization.core import (
-    quantize_state_dict_to_codes,
-    qmax_for_bits
+    qmax_for_bits,
+    quantize_weights_by_scheme
 )
+from train.utils import load_state_dict
 
 
 def fold_batchnorm_into_weights(state_dict):
@@ -76,26 +76,6 @@ def fold_batchnorm_into_weights(state_dict):
 # -----------------------------
 # IO helpers
 # -----------------------------
-def load_state_dict(path: str) -> Dict[str, torch.Tensor]:
-    """
-    Load a state_dict from a .pt file. Supports:
-      - raw state_dict (param_name -> tensor)
-      - checkpoint dict with "model" key
-      - checkpoint dict with "state_dict" key
-    """
-    obj = torch.load(path, map_location="cpu")
-    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
-        print("[INFO] Detected wrapper with 'state_dict' key.")
-        return obj["state_dict"]
-    if isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
-        print("[INFO] Detected checkpoint with 'model' key.")
-        return obj["model"]
-    if isinstance(obj, dict):
-        print("[INFO] Detected raw state_dict.")
-        return obj
-    raise ValueError("Unsupported weights file format: expected a state_dict or checkpoint dict.")
-
-
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
@@ -256,7 +236,13 @@ def plot_multi_quant_histograms(
     # Quantized variants (integer codes)
     for b in bits_list:
         qmax = qmax_for_bits(b)
-        q_codes = quantize_state_dict_to_codes(state_dict, bits=b, scheme=scheme, global_percentile=global_percentile)
+        q_codes = quantize_weights_by_scheme(
+            state_dict=state_dict,
+            bits=b,
+            scheme=scheme,
+            global_percentile=global_percentile,
+            return_codes=True
+        )
         edges = np.arange(-qmax - 0.5, qmax + 1.5, 1.0)
         q_zeros = int(np.count_nonzero(q_codes == 0))
         q_nonzeros = int(q_codes.size - q_zeros)
@@ -386,7 +372,7 @@ def main():
     # --- Print all bias parameters with summary ---
     
     parser = argparse.ArgumentParser(description="Visualize model weights with histograms and multi-quant (aligned bins).")
-    parser.add_argument("--weights", type=str, required=True, help="Path to .pt (state_dict or checkpoint).")
+    parser.add_argument("--path", type=str, required=True, help="Path to .pt (state_dict or checkpoint).")
     parser.add_argument("--outdir", type=str, default="plots/weights_viz", help="Directory to save figures.")
     parser.add_argument("--bins", type=int, default=100, help="Bins for float histograms (overall & per-parameter).")
     parser.add_argument("--zero-threshold", type=float, default=0.0,
@@ -403,7 +389,7 @@ def main():
     args = parser.parse_args()
 
     ensure_dir(args.outdir)
-    sd = load_state_dict(args.weights)
+    sd = load_state_dict(args.path)
     print("[DEBUG] All state_dict keys:", list(sd.keys()))
 
     # --- Print loaded state_dict keys and tensor shapes ---
@@ -479,7 +465,13 @@ def main():
         bits_list = parse_bits_list(args.quant_bits)
         if bits_list:
             for b in bits_list:
-                q_codes = quantize_state_dict_to_codes(sd, bits=b, scheme=args.quant_scheme, global_percentile=args.global_percentile)
+                q_codes = quantize_weights_by_scheme(
+                    state_dict=sd,
+                    bits=b,
+                    scheme=args.quant_scheme,
+                    global_percentile=args.global_percentile,
+                    return_codes=True
+                )
                 if q_codes.size > 0:
                     print(f"[QUANTIZED {b}-bit {args.quant_scheme}] min={q_codes.min()} max={q_codes.max()}")
                 else:

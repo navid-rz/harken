@@ -5,8 +5,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 from train.utils import (
-    load_config, build_model_from_cfg, load_state_dict_forgiving,
+    load_state_dict_forgiving,
 )
+from config import load_config
+from model.model import DilatedTCN
 from data_loader.utils import (
     get_num_classes, make_datasets
 )
@@ -203,7 +205,7 @@ def main():
     sample_x = sample_batch[0] if isinstance(sample_batch, (list, tuple)) else sample_batch["x"]
     sample_x = sample_x[0]
     num_classes = get_num_classes(cfg)
-    model = build_model_from_cfg(cfg, sample_x, num_classes)
+        model = DilatedTCN.from_config(cfg)
     model = load_state_dict_forgiving(model, args.weights, device).to(device).eval()
 
     criterion = nn.CrossEntropyLoss() if task_type == "multiclass" else nn.BCEWithLogitsLoss()
