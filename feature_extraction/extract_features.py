@@ -8,7 +8,7 @@ from typing import Optional, Literal
 
 
 def extract_features(
-    filepath, 
+    filepath_or_audio, 
     sr=16000, 
     n_features=16,
     frame_length=0.02, 
@@ -17,10 +17,10 @@ def extract_features(
     feature_type: Literal["mfcc", "log-mel"] = "mfcc"
 ):
     """
-    Extract audio features from a file - either MFCC or log-mel spectrogram.
+    Extract audio features from a file or audio array - either MFCC or log-mel spectrogram.
     
     Args:
-        filepath (str): Path to the .wav file.
+        filepath_or_audio (str or np.ndarray): Path to .wav file or audio data array.
         sr (int): Target sampling rate.
         n_features (int): Number of features (MFCCs or mel bands).
         frame_length (float): Window size in seconds.
@@ -31,7 +31,12 @@ def extract_features(
     Returns:
         Tuple[np.ndarray, np.ndarray]: waveform (1D), features (2D: time x n_features)
     """
-    y, sr = librosa.load(filepath, sr=sr)
+    if isinstance(filepath_or_audio, str):
+        # Load from file
+        y, sr = librosa.load(filepath_or_audio, sr=sr)
+    else:
+        # Use provided audio array
+        y = np.asarray(filepath_or_audio)
     
     n_fft = int(frame_length * sr)
     hop_samples = int(hop_length * sr)

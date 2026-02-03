@@ -6,6 +6,11 @@
 - **Test MFCC vs log-mel features:** python -m feature_extraction.extract_features
   - MFCC: 16 coefficients, can be negative (use for signed int8 hardware)
   - Log-mel: 40 bands, all positive (use for unsigned uint8 hardware)
+- **Preprocess dataset:** python -m feature_extraction.preprocess_features --config config/base.yaml
+  - Extracts features from all WAV files in data/speech_commands_v0.02/
+  - Saves as .npy files in data/preprocessed/
+  - Feature type (mfcc/log-mel), normalization controlled by config
+- **Analyze range of values for preprocessed data:** python -m data.analyze_preprocessed_features --data-dir data/preprocessed_log_mel_40_norm --feature-type log-mel
 
 **Training**
 - **Run trainer as module:** python -m train.train --config config/base.yaml

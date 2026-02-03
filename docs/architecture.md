@@ -24,7 +24,7 @@ data/preprocessed (MFCCs)
 
 Where code hooks live:
 - Model builder: `DilatedTCN.from_config` reads `config/base.yaml` `model` block.
-- Datasets: `data_loader.utils.make_datasets` sets up splits, transforms, and `MFCCAugment` when enabled.
+- Datasets: `data_loader.utils.make_datasets` sets up splits, transforms, and `FeatureAugment` when enabled.
 - Quantization/export: `quantization.core.quantize_model_weights` and `quantize_state_dict_to_codes`.
 
 Notes and suggestions for contributors:

@@ -2,14 +2,51 @@
 
 This page summarizes the key mathematical formulas and numeric choices used in Harken.
 
-**MFCC processing**
-- Sampling rate: $\mathrm{sr}=16000$ (from `config/base.yaml`).
-- Window / FFT sizes (seconds → samples):
-  - Frame length $L_s = \text{frame\_length\_s}$ → $N_{fft} = \lfloor L_s \cdot sr \rceil$ (example: $0.032\,s \times 16000 = 512$ samples).
-  - Hop length $H_s = \text{hop\_length\_s}$ → $H = \lfloor H_s \cdot sr \rceil$ (example: $0.016\,s \times 16000 = 256$ samples).
-- MFCC matrix shape: time-steps × `n_mfcc` (project defaults use `n_mfcc=28`). `extract_mfcc.py` returns `(y, mfcc.T)` so frames are rows.
+## Audio Feature Extraction
 
-**Temporal Convolutional Network (TCN)**
+### Log-Mel Spectrogram vs MFCC
+
+**Log-Mel Spectrogram Pipeline:**
+1. Short-Time Fourier Transform (STFT): $X(f,t) = \sum_{\tau} w(\tau) x(\tau) e^{-j2\pi f\tau}$
+2. Power spectrum: $P(f,t) = |X(f,t)|^2$
+3. Mel filterbank (40-80 triangular filters): $M_k(t) = \sum_f H_k(f) P(f,t)$
+4. Natural log compression: $\text{LogMel}_k(t) = \ln(M_k(t) + \epsilon)$
+5. Shift to positive range: $\text{LogMel}_k(t) = \text{LogMel}_k(t) - \min(\text{LogMel})$
+
+**Output**: 40-80 bands, all positive values
+
+**MFCC (Mel-Frequency Cepstral Coefficients) Pipeline:**
+1. Steps 1-4 same as log-mel (compute log mel-spectrogram)
+2. **Discrete Cosine Transform (DCT)**: $\text{MFCC}_n = \sum_{k=0}^{K-1} \text{LogMel}_k \cos\left[\frac{\pi n(k+0.5)}{K}\right]$
+3. Keep first 13-16 coefficients (discard higher-order terms)
+
+**Output**: 13-16 coefficients, **can be negative** (due to DCT basis functions)
+
+**Key Difference**: MFCC = Log-Mel + DCT decorrelation + dimensionality reduction
+
+**Usage in Voice Recognition:**
+
+| Aspect | Log-Mel | MFCC |
+|--------|---------|------|
+| **Era** | Modern (2010s+) | Traditional (1980s-2000s) |
+| **Deep Learning** | ✅ Preferred (CNNs, Transformers) | ⚠️ Less common |
+| **Hardware** | ✅ Unsigned int (all positive) | ⚠️ Needs signed int |
+| **Dimensionality** | Higher (40-80 bands) | Lower (13-16 coeffs) |
+| **Information** | Full spectral detail | DCT-compressed |
+| **Model examples** | Wav2Vec, Whisper, modern KWS | GMM-HMM, classic systems |
+
+**Why log-mel dominates modern systems:**
+- CNNs/Transformers learn the decorrelation that DCT provided manually
+- More input data (40 bands > 13 coeffs) enables better feature learning
+- Hardware-friendly: all positive → unsigned integers, simpler quantization
+- End-to-end learning: raw spectrograms let networks discover optimal representations
+
+**When MFCC still used:**
+- Legacy systems with existing MFCC pipelines
+- Extremely memory-constrained devices (13 dims < 40 dims)
+- Classical ML (SVM, GMM) where DCT decorrelation helps
+
+## Temporal Convolutional Network (TCN)
 - Convolutions are 1D over the time dimension; input tensors are shaped `(N, C_in, T)` where `C_in` is MFCC channels.
 - Exponential dilation schedule per block: $d_i = 2^i$ for block index $i=0..B-1$ (see `model.DilatedTCN`).
 - Two convolutions per residual block; when causal padding is used the effective padding per conv is $(k-1)\cdot d$ and the implementation trims the right side to enforce causality.

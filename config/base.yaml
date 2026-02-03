@@ -1,7 +1,7 @@
 ﻿# Common defaults for both binary and multiclass runs
 
 data:
-  preprocessed_dir: "data/preprocessed"
+  preprocessed_dir: "data/preprocessed_log_mel_40_norm"
   val_split: 0.20
   test_split: 0.10
 
@@ -16,7 +16,7 @@ data:
     frame_length_s: 0.032      # seconds
     hop_length_s: 0.016        # seconds
     fixed_duration_s: 1.024    # seconds (pad/truncate)
-    normalize: false           # normalize to fixed range (required for hardware deployment with fixed scales)
+    normalize: true            # normalize each sample audio file to [0, 1]
 
 augmentation:
   enable: true               # turn off by setting false

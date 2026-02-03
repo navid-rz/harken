@@ -14,14 +14,18 @@ from model.model import DilatedTCN
 
 def get_mfcc_section(cfg: dict) -> dict:
     """
-    Locate MFCC settings in config. Supports:
-      cfg['mfcc']
-      cfg['data']['mfcc']
+    Locate feature settings in config (MFCC or log-mel). Supports:
+      cfg['features']
+      cfg['data']['features']
+      cfg['mfcc']  (backward compat)
+      cfg['data']['mfcc']  (backward compat)
       cfg['features']['mfcc']
       cfg['audio']['mfcc']
     """
     return (
-        cfg.get("mfcc")
+        cfg.get("features")
+        or cfg.get("data", {}).get("features")
+        or cfg.get("mfcc")
         or cfg.get("data", {}).get("mfcc")
         or cfg.get("features", {}).get("mfcc")
         or cfg.get("audio", {}).get("mfcc")

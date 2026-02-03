@@ -1,7 +1,7 @@
 from torch.utils.data import Dataset
 class BinaryClassDataset(Dataset):
     """
-    Wraps a base MFCCDataset for binary KWS without loading any arrays in __init__.
+    Wraps a base FeatureDataset for binary KWS without loading any arrays in __init__.
     We derive positive/negative indices from base metadata, and only load x in __getitem__.
     """
     def __init__(self, base_dataset, target_word, index_to_label,
@@ -15,7 +15,7 @@ class BinaryClassDataset(Dataset):
         # --- Grab labels without loading MFCC arrays ---
         labels_int = None
 
-        # Preferred: if your MFCCDataset stores a list of (path, label_idx)
+        # Preferred: if your FeatureDataset stores a list of (path, label_idx)
         if hasattr(base_dataset, "samples"):
             # common pattern: samples = [(path, label_idx), ...]
             try:
@@ -30,13 +30,13 @@ class BinaryClassDataset(Dataset):
             except Exception:
                 labels_int = None
 
-        # Last resort (slower): add a label-only accessor to MFCCDataset if you have it
+        # Last resort (slower): add a label-only accessor to FeatureDataset if you have it
         if labels_int is None and hasattr(base_dataset, "get_label"):
             labels_int = [base_dataset.get_label(i) for i in range(len(base_dataset))]
 
         # Absolute fallback (will be slow): this will load arrays; avoid if possible
         if labels_int is None:
-            print("[WARN] Falling back to loading items to get labels; consider exposing 'samples' in MFCCDataset.")
+            print("[WARN] Falling back to loading items to get labels; consider exposing 'samples' in FeatureDataset.")
             labels_int = [base_dataset[i][1] for i in range(len(base_dataset))]
 
         # --- Build positive/negative index lists ---

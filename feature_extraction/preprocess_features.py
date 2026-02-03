@@ -2,44 +2,12 @@
 
 import os
 import argparse
-from copy import deepcopy
 import numpy as np
 import librosa
 from tqdm import tqdm
-import yaml
 from feature_extraction.extract_features import extract_features
-
-
-def deep_update(dst, src):
-    for k, v in src.items():
-        if isinstance(v, dict) and isinstance(dst.get(k), dict):
-            deep_update(dst[k], v)
-        else:
-            dst[k] = v
-    return dst
-
-
-def _load_yaml_with_encodings(path):
-    import yaml
-    # Try UTF-8 first; then UTF-8 with BOM; then cp1252 as a last resort.
-    for enc in ("utf-8", "utf-8-sig", "cp1252"):
-        try:
-            with open(path, "r", encoding=enc) as f:
-                return yaml.safe_load(f)
-        except UnicodeDecodeError:
-            continue
-    # If we get here, re-raise with a helpful error
-    raise UnicodeDecodeError("yaml", b"", 0, 1, f"Could not decode {path} with utf-8/utf-8-sig/cp1252")
-
-def load_config(path):
-    cfg_task = _load_yaml_with_encodings(path)
-
-    # Optional base.yaml merge (same pattern as train.py)
-    base_path = os.path.join(os.path.dirname(path), "base.yaml")
-    if os.path.basename(path) != "base.yaml" and os.path.exists(base_path):
-        cfg_base = _load_yaml_with_encodings(base_path)
-        return deep_update(deepcopy(cfg_base), cfg_task)
-    return cfg_task
+from config import load_config
+import time
 
 
 def preprocess_and_save_all_features(
@@ -52,6 +20,7 @@ def preprocess_and_save_all_features(
     fixed_duration_s,
     feature_type="mfcc",
     normalize=False,
+    limit_per_class=None,
 ):
     hop_samples   = int(hop_length_s  * sr)
     frame_samples = int(frame_length_s * sr)
@@ -74,68 +43,81 @@ def preprocess_and_save_all_features(
     labels = [d for d in os.listdir(input_dir) if os.path.isdir(os.path.join(input_dir, d))]
     labels.sort()
 
-    # For normalization: collect global max if normalize=True
-    global_max = None
-    if normalize:
-        print("[Features] Computing global max for normalization (pass 1)...")
-        all_maxs = []
+    # Count total files for progress tracking
+    total_files = 0
+    for label in labels:
+        label_path = os.path.join(input_dir, label)
+        wav_files = [f for f in os.listdir(label_path) if f.lower().endswith(".wav")]
+        if limit_per_class is not None:
+            wav_files = wav_files[:limit_per_class]
+        total_files += len(wav_files)
+    
+    print(f"[Features] Total files to process: {total_files}")
+    
+    # Start timing
+    start_time = time.time()
+    processed = 0
+    failed = 0
+
+    # Overall progress bar
+    with tqdm(total=total_files, desc="Overall Progress", unit="file") as pbar:
         for label in labels:
             label_path = os.path.join(input_dir, label)
+            out_label_dir = os.path.join(output_dir, label)
+            os.makedirs(out_label_dir, exist_ok=True)
+
             wav_files = [f for f in os.listdir(label_path) if f.lower().endswith(".wav")]
-            for fname in tqdm(wav_files, desc=f"Scanning '{label}'", leave=False):
+            wav_files.sort()
+            
+            # Limit files per class if specified
+            if limit_per_class is not None:
+                wav_files = wav_files[:limit_per_class]
+
+            for fname in wav_files:
+                in_path = os.path.join(label_path, fname)
+                out_path = os.path.join(out_label_dir, fname.replace(".wav", ".npy"))
+
                 try:
-                    in_path = os.path.join(label_path, fname)
+                    # Load and pad/truncate audio
                     y, _ = librosa.load(in_path, sr=sr)
                     if len(y) < fixed_len:
                         y = np.pad(y, (0, fixed_len - len(y)), mode="constant")
                     else:
                         y = y[:fixed_len]
+
+                    # Normalize audio time samples if enabled (AGC behavior - normalize input signal)
+                    if normalize:
+                        sample_max = np.abs(y).max()
+                        if sample_max > 0:
+                            y = y / sample_max
+
+                    # Extract features using unified function with the (potentially normalized) audio
                     _, features = extract_features(
-                        in_path, sr=sr, n_features=n_features,
+                        y, sr=sr, n_features=n_features,  # Pass audio array instead of file path
                         frame_length=frame_length_s, hop_length=hop_length_s,
                         feature_type=feature_type
                     )
-                    all_maxs.append(np.abs(features).max())
+                    
+                    # Save as (time, n_features)
+                    np.save(out_path, features)
+                    processed += 1
                 except Exception as e:
-                    pass
-        global_max = np.max(all_maxs) if all_maxs else 1.0
-        print(f"[Features] Global max: {global_max:.4f}")
+                    failed += 1
+                    tqdm.write(f"[WARN] Failed: {in_path} -> {e}")
+                finally:
+                    pbar.update(1)
+                    # Update description with current label
+                    pbar.set_postfix(label=label, failed=failed)
+    
+    # Print summary
+    elapsed = time.time() - start_time
+    print(f"\n[Summary]")
+    print(f"  Total processed: {processed}/{total_files}")
+    print(f"  Failed: {failed}")
+    print(f"  Time elapsed: {elapsed:.1f}s ({elapsed/60:.1f} min)")
+    if processed > 0:
+        print(f"  Avg time per file: {elapsed/processed:.3f}s")
 
-    for label in labels:
-        label_path = os.path.join(input_dir, label)
-        out_label_dir = os.path.join(output_dir, label)
-        os.makedirs(out_label_dir, exist_ok=True)
-
-        wav_files = [f for f in os.listdir(label_path) if f.lower().endswith(".wav")]
-        wav_files.sort()
-
-        for fname in tqdm(wav_files, desc=f"Processing '{label}'", leave=False):
-            in_path = os.path.join(label_path, fname)
-            out_path = os.path.join(out_label_dir, fname.replace(".wav", ".npy"))
-
-            try:
-                # Load and pad/truncate audio
-                y, _ = librosa.load(in_path, sr=sr)
-                if len(y) < fixed_len:
-                    y = np.pad(y, (0, fixed_len - len(y)), mode="constant")
-                else:
-                    y = y[:fixed_len]
-
-                # Extract features using unified function
-                _, features = extract_features(
-                    in_path, sr=sr, n_features=n_features,
-                    frame_length=frame_length_s, hop_length=hop_length_s,
-                    feature_type=feature_type
-                )
-                
-                # Normalize if enabled
-                if normalize and global_max is not None and global_max > 0:
-                    features = features / global_max
-                
-                # Save as (time, n_features)
-                np.save(out_path, features)
-            except Exception as e:
-                print(f"[WARN] Failed: {in_path} -> {e}")
 
 
 def main():
@@ -145,6 +127,7 @@ def main():
     # Optional quick overrides (leave unset to use YAML)
     ap.add_argument("--raw-dir", type=str, default=None, help="Override data.raw_dir")
     ap.add_argument("--out-dir", type=str, default=None, help="Override data.preprocessed_dir")
+    ap.add_argument("--limit", type=int, default=None, help="Process only N files per class (for testing)")
     args = ap.parse_args()
 
     cfg = load_config(args.config)
@@ -172,6 +155,7 @@ def main():
         fixed_duration_s=fixed_duration_s,
         feature_type=feature_type,
         normalize=normalize,
+        limit_per_class=args.limit,
     )
 
     print(f"[OK] Done! {feature_type.upper()} features saved in {output_dir}")

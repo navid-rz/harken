@@ -1,0 +1,65 @@
+# MFCC 28 features with audio-level AGC normalization
+# Test: Does audio normalization help or hurt MFCC performance?
+
+data:
+  preprocessed_dir: "data/preprocessed_mfcc_28_norm"
+  val_split: 0.20
+  test_split: 0.10
+  raw_dir: "data/speech_commands_v0.02"
+  
+  features:
+    type: mfcc
+    sample_rate: 16000
+    n_features: 28
+    frame_length_s: 0.032
+    hop_length_s: 0.016
+    fixed_duration_s: 1.024
+    normalize: true  # Audio AGC normalization
+
+augmentation:
+  enable: true
+  max_shift_ms: 100
+  noise_prob: 0.15
+  noise_std_factor: 0.05
+  seed: 0
+
+task:
+  type: multiclass
+  class_list: ["yes", "no", "up", "down", "left", "right", "on", "off", "stop", "go"]
+  include_unknown: true
+  include_background: false
+  unknown_max_ratio: null
+  unknown_max_count: null
+
+model:
+  hidden_channels: 26
+  kernel_size: 3
+  dropout: 0.2
+  num_blocks: 4
+  causal: true
+  activation: relu
+  norm: none
+  groups_for_groupnorm: 8
+  depthwise_separable: false
+  weight_norm: false
+  pool_type: avg
+  global_pool_adaptive: false
+  bias: false
+
+train:
+  num_epochs: 50
+  batch_size: 256
+  learning_rate: 0.0003
+  weight_decay: 0.00001
+  device: auto
+  pos_weight: null
+  threshold: 0.5
+  auto_threshold: false
+  threshold_search_steps: 101
+  class_weights: null
+  label_smoothing: 0.0
+
+output:
+  weights_dir: "checkpoints/mfcc28_agc"
+  plots_dir: "plots/mfcc28_agc"
+  tqdm: true

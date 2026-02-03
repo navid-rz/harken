@@ -3,7 +3,11 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
 
-class MFCCDataset(Dataset):
+class FeatureDataset(Dataset):
+    """
+    Generic dataset for preprocessed audio features (MFCC or log-mel spectrograms).
+    Loads .npy files from a directory structure where each subfolder represents a label.
+    """
     def __init__(self, root_dir, transform=None):
         """
         Args:
@@ -15,6 +19,7 @@ class MFCCDataset(Dataset):
 
         self.samples = []          # list of (file_path, label_idx)
         self.label_to_index = {}   # e.g., {"yes":0, "no":1, ...}
+        self.index_to_label = {}   # reverse mapping
         self._prepare_dataset()
 
         # quick access to labels only (no I/O)
@@ -29,6 +34,7 @@ class MFCCDataset(Dataset):
                 continue
             if label_name not in self.label_to_index:
                 self.label_to_index[label_name] = label_idx
+                self.index_to_label[label_idx] = label_name
                 label_idx += 1
 
             for fname in sorted(os.listdir(label_path)):
@@ -40,23 +46,25 @@ class MFCCDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        file_path, label = self.samples[idx]
+        file_path, label_idx = self.samples[idx]
 
-        # mfcc saved as (time, n_mfcc) in your preprocessor => transpose to (C, T)
-        # If needed, set allow_pickle=False for safety.
-        mfcc = np.load(file_path)
-        x = torch.from_numpy(mfcc).float()        # (T, C)
-        x = x.transpose(0, 1).contiguous()        # (C, T)
+        # Load features and ensure we have a clean, resizable tensor
+        features = np.load(file_path, mmap_mode=None, allow_pickle=False)
+        # Convert to tensor with own storage - no sharing with numpy
+        x = torch.tensor(features, dtype=torch.float32)  # Creates new tensor with own storage
+        x = x.transpose(0, 1).contiguous()  # (C, T)
 
         if self.transform is not None:
-            x = self.transform(x)                 # transform expects (C, T)
+            x = self.transform(x)
 
-        return x, label
+        # Return label name instead of index for MultiClassDataset compatibility
+        label_name = self.index_to_label[label_idx]
+        return x, label_name
 
 
 # Example quick check
 if __name__ == "__main__":
-    ds = MFCCDataset("data/preprocessed")
+    ds = FeatureDataset("data/preprocessed")
     print("Num samples:", len(ds))
     x0, y0 = ds[0]
     print("First item:", x0.shape, y0)           # expect (C, T), e.g., (16 or 28, ~60-100)

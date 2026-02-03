@@ -30,13 +30,20 @@ def _infer_num_classes(cfg: dict) -> int:
 
 
 def _infer_mfcc_shape(cfg: dict) -> tuple[int, int]:
-    # Returns (C, T)
-    mfcc = cfg["data"]["mfcc"]
-    C = int(mfcc["n_mfcc"])
-    hop = float(mfcc["hop_length_s"])
-    dur = float(mfcc["fixed_duration_s"])
+    # Returns (C, T) - works for both MFCC and log-mel features
+    # Support both 'features' and 'mfcc' keys for backward compatibility
+    feature_cfg = cfg["data"].get("features", cfg["data"].get("mfcc", {}))
+    if not feature_cfg:
+        raise ValueError("Config must define either data.features or data.mfcc")
+    
+    # Try n_features first (general), then n_mfcc (backward compat), then n_mels
+    C = int(feature_cfg.get("n_features", 
+                           feature_cfg.get("n_mfcc", 
+                                         feature_cfg.get("n_mels", 40))))
+    hop = float(feature_cfg["hop_length_s"])
+    dur = float(feature_cfg["fixed_duration_s"])
     if hop <= 0 or dur <= 0:
-        raise ValueError("mfcc.hop_length_s and mfcc.fixed_duration_s must be > 0")
+        raise ValueError("feature config hop_length_s and fixed_duration_s must be > 0")
     T = int(round(dur / hop))
     return C, T
 

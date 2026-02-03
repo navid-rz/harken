@@ -318,9 +318,15 @@ class DilatedTCN(nn.Module):
         """
         m = cfg["model"]
         t = cfg["task"]
-        mfcc = cfg["data"]["mfcc"]
+        # Support both 'features' and 'mfcc' keys for backward compatibility
+        feature_cfg = cfg["data"].get("features", cfg["data"].get("mfcc", {}))
+        if not feature_cfg:
+            raise ValueError("Config must define either data.features or data.mfcc")
 
-        input_channels = int(mfcc["n_mfcc"])
+        # Try n_features first (general), then n_mfcc (backward compat), then n_mels
+        input_channels = int(feature_cfg.get("n_features", 
+                                             feature_cfg.get("n_mfcc", 
+                                                           feature_cfg.get("n_mels", 40))))
         kernel_size = int(m["kernel_size"])
         hidden_channels = int(m["hidden_channels"])
         dropout = float(m["dropout"])

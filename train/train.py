@@ -20,7 +20,7 @@ from train.utils import (
 from config import load_config
 from model.model import DilatedTCN
 
-from data_loader.utils import make_datasets, TransformDataset, MFCCAugment
+from data_loader.utils import make_datasets, FeatureAugment
 from analysis.plot_metrics import plot_metrics, plot_test_confusion_matrix
 from train.evaluate import evaluate_model
 
@@ -42,73 +42,45 @@ class Trainer:
         else:
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Build datasets/loaders
-        self.train_loader, self.val_loader, self.test_loader = make_datasets(self.cfg, which="all", batch_size=self.cfg["train"]["batch_size"])
-        self.train_dataset = self.train_loader.dataset
-        self.val_dataset   = self.val_loader.dataset
-        self.test_dataset  = self.test_loader.dataset
+        # Pin memory for faster GPU transfer (only beneficial with CUDA)
+        self.pin_memory = self.device.type == "cuda"
 
-        # Get number of classes from dataset (class_list + unknown/background flags)
-        self.num_classes = self.train_dataset.num_classes
-        print(f"[INFO] Detected {self.num_classes} classes")
-
-        # Augmentation (training split only)
+        # Build datasets/loaders with augmentation flag
         aug_cfg = cfg.get("augmentation", {})
         use_aug = bool(aug_cfg.get("enable", False))
+        augment = None
         if use_aug:
-            hop_s = float(cfg["data"]["mfcc"]["hop_length_s"])
-            augment = MFCCAugment(
+            # Try feature-specific hop length, fall back to mfcc for backward compatibility
+            feature_cfg = cfg.get("data", {}).get("features", cfg.get("data", {}).get("mfcc", {}))
+            hop_s = float(feature_cfg.get("hop_length_s", 0.01))
+            augment = FeatureAugment(
                 hop_length_s=hop_s,
                 max_shift_ms=float(aug_cfg.get("max_shift_ms", 100.0)),
                 noise_prob=float(aug_cfg.get("noise_prob", 0.15)),
                 noise_std_factor=float(aug_cfg.get("noise_std_factor", 0.05)),
                 seed=aug_cfg.get("seed", None),
             )
-            train_set_for_loader = TransformDataset(self.train_dataset, transform=augment)
-        else:
-            train_set_for_loader = self.train_dataset
+        
+        self.train_loader, self.val_loader, self.test_loader = make_datasets(
+            self.cfg, which="all", batch_size=self.cfg["train"]["batch_size"], train_transform=augment
+        )
+        self.train_dataset = self.train_loader.dataset
+        self.val_dataset   = self.val_loader.dataset
+        self.test_dataset  = self.test_loader.dataset
 
-        # Loaders
+        # Get number of classes from dataset
+        self.num_classes = self.train_dataset.num_classes
+        print(f"[INFO] Detected {self.num_classes} classes")
+
+        # Loaders already created by make_datasets
         self.batch_size = int(cfg["train"]["batch_size"])
-
-        # Configure performant DataLoader options
-        is_cuda = (self.device.type == "cuda")
-        nw = int(cfg["train"].get("num_workers", 0 if not is_cuda else 2))
-        self.pin_memory = bool(cfg["train"].get("persistent_workers", nw > 0))
-        persist = bool(cfg["train"].get("persistent_workers", nw > 0))
-        prefetch = int(cfg["train"].get("prefetch_factor", 2))
-
-        loader_kwargs = {
-            "batch_size": self.batch_size,
-            "shuffle": True,
-            "num_workers": nw,
-            "pin_memory": self.pin_memory,
-        }
-        if nw > 0:
-            loader_kwargs["persistent_workers"] = persist
-            loader_kwargs["prefetch_factor"] = prefetch
-
-        self.train_loader = DataLoader(train_set_for_loader, **loader_kwargs)
-
-        val_kwargs = {
-            "batch_size": self.batch_size,
-            "shuffle": False,
-            "num_workers": nw,
-            "pin_memory": self.pin_memory,
-        }
-        if nw > 0:
-            val_kwargs["persistent_workers"] = persist
-            val_kwargs["prefetch_factor"] = prefetch
-
-        self.val_loader  = DataLoader(self.val_dataset,  **val_kwargs)
-        self.test_loader = DataLoader(self.test_dataset, **val_kwargs)
 
         # Build model via shared constructor
         sample_x, _ = self.train_dataset[0]  # (C, T)
         if sample_x.dim() == 3:  # safety if any wrapper returns (B,C,T)
             sample_x = sample_x[0]
         C, T = int(sample_x.shape[0]), int(sample_x.shape[1])
-        print(f"[MFCC dims] channels(C)={C}  timesteps(T)={T}")
+        print(f"[Feature dims] channels(C)={C}  timesteps(T)={T}")
         self.model = DilatedTCN.from_config(cfg).to(self.device)
         self.input_shape = (C, T)  # save for checkpoint metadata
 
@@ -156,7 +128,7 @@ class Trainer:
         self.csv_path = os.path.join(self.plots_dir, "metrics.csv")
         self._init_csv_log()
 
-        # ---- Sanity checks: dataset sizes and MFCC shapes ----
+        # ---- Sanity checks: dataset sizes and feature shapes ----
         print(f"[Split sizes] train={len(self.train_dataset)}  val={len(self.val_dataset)}  test={len(self.test_dataset)}")
 
         # Peek a few samples from the training subset
@@ -164,33 +136,25 @@ class Trainer:
             x_i, y_i = self.train_dataset[i]
             print(f"[Sample {i}] x.shape={tuple(x_i.shape)}  label={y_i}")
 
-        # Derive input dims to confirm (C, T)
-        sample_x, _ = self.train_dataset[0]
-        C, T = sample_x.shape
-        print(f"[MFCC dims] channels(C)={C}  timesteps(T)={T}")
-
         # Print total number of trainable weights
         total_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad)
         print(f"[TCN] Total trainable weights: {total_params}")
 
+        # Check dataset balance/distribution
         if self.task_type == "binary":
-            import numpy as np
             ys = [self.train_dataset[i][1] for i in range(len(self.train_dataset))]
             pos = int(np.sum(ys)); neg = len(ys) - pos
             print(f"[Train balance] pos={pos}  neg={neg}  ratio={neg/max(1,pos):.2f}:1")
         
         if self.task_type == "multiclass":
-            import numpy as np
             ys = [self.train_dataset[i][1] for i in range(len(self.train_dataset))]
             counts = np.bincount(ys, minlength=self.num_classes)
             print(f"[Train per-class counts] {counts.tolist()}")
             print(f"[Classes] {self.class_names}")
 
-
- 
         # Optional: assert reasonable ranges (adjust to your expectations)
-        assert C in (16, 20, 28, 40) or C > 0, f"Unexpected MFCC channels: {C}"
-        assert T >= 40, f"Too few time steps ({T}). Check MFCC hop/window/duration."
+        assert C in (16, 20, 28, 40, 64, 80, 128) or C > 0, f"Unexpected feature channels: {C}"
+        assert T >= 40, f"Too few time steps ({T}). Check feature extraction hop/window/duration."
 
     def _loop(self, loader: DataLoader, train_mode: bool = True) -> Tuple[float, float, float, float, float]:
         if train_mode:
