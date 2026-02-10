@@ -46,7 +46,7 @@ model:
   # Convolutional block options
   causal: true                      # causal padding + right-trim
   activation: relu                  # relu | gelu | prelu
-  norm: none                       # batch | group | layer | none
+  norm: batch                      # batch | group | layer | none
   groups_for_groupnorm: 8           # only used when norm=group
   use_weight_norm: false            # apply weight_norm to convs
   depthwise_separable: false        # use depthwise+pointwise convs
@@ -55,10 +55,18 @@ model:
 
 train:
   batch_size: 32
-  num_epochs: 50
+  num_epochs: 100
   learning_rate: 1.0e-4
   weight_decay: 1.0e-5
   device: auto               # "auto" | "cuda" | "cpu"
+
+  # Early stopping configuration
+  early_stopping:
+    enabled: true
+    patience: 10             # Stop if no improvement for 10 epochs
+    metric: "val_loss"        # Monitor validation loss
+    min_delta: 0.001         # Minimum change to qualify as improvement
+    restore_best: true       # Load best weights before stopping
 
   # DataLoader performance knobs
   num_workers: 2             # >0 enables parallel loading (Windows-safe if main-guarded)

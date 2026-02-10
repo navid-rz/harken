@@ -10,6 +10,104 @@ def qmax_for_bits(bits: int) -> int:
     return (1 << (bits - 1)) - 1
 
 
+def compute_log2_levels(max_abs_val: float, num_levels: int = 8) -> tuple[np.ndarray, float]:
+    """
+    Compute fixed log2 quantization levels and scale factor for hardware implementation.
+    
+    Args:
+        max_abs_val: Maximum absolute value in the data (typically percentile value)
+        num_levels: Number of levels determines max level as 2^num_levels
+    
+    Returns:
+        Tuple of (fixed_levels_array, scale_factor)
+        - levels: Fixed array [-2^num_levels, ..., -1, 0, 1, ..., 2^num_levels]
+        - scale_factor: Factor to scale weights so max_abs_val maps to 2^num_levels
+    """
+    if max_abs_val == 0:
+        levels = np.array([0])
+        return levels, 1.0
+    
+    # Create fixed power-of-2 levels: ±1, ±2, ±4, ±8, ... ±2^num_levels
+    max_level = 2 ** num_levels  # e.g., if num_levels=4, max_level=16
+    pos_levels = np.array([2**i for i in range(num_levels + 1)])  # [1, 2, 4, 8, 16]
+    
+    # Full level set: negative levels, zero, positive levels
+    neg_levels = -pos_levels[::-1]  # [-16, -8, -4, -2, -1]
+    levels = np.concatenate([neg_levels, [0], pos_levels])  # [-16,-8,-4,-2,-1,0,1,2,4,8,16]
+    
+    # Compute scale factor: scale weights so max_abs_val maps to max_level (2^num_levels)
+    scale_factor = max_abs_val / max_level
+    
+    return levels, scale_factor
+
+
+def quantize_to_log2(data: np.ndarray, num_levels: int = 8, max_abs_val: Optional[float] = None) -> np.ndarray:
+    """
+    Quantize data to fixed log2 integer levels for hardware implementation.
+    
+    Args:
+        data: Input data to quantize
+        num_levels: Number of levels determines max level as 2^num_levels
+        max_abs_val: Maximum absolute value for scaling (if None, use data max)
+    
+    Returns:
+        Quantized integer levels: values like [-16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16]
+    """
+    if data.size == 0:
+        return data.copy().astype(np.int32)
+    
+    if max_abs_val is None:
+        max_abs_val = np.abs(data).max()
+    
+    if max_abs_val == 0:
+        return np.zeros_like(data, dtype=np.int32)
+    
+    # Get fixed levels and scale factor
+    levels, scale_factor = compute_log2_levels(max_abs_val, num_levels)
+    
+    # Scale data to fit the fixed levels
+    scaled_data = data / scale_factor
+    
+    # Quantize to nearest fixed level (return the integer levels directly)
+    quantized = np.zeros_like(scaled_data, dtype=np.int32)
+    for i, val in enumerate(scaled_data.flat):
+        if val == 0:
+            quantized.flat[i] = 0
+        else:
+            # Find closest level by minimizing absolute difference
+            distances = np.abs(levels - val)
+            closest_idx = np.argmin(distances)
+            quantized.flat[i] = int(levels[closest_idx])  # Return the integer level
+    
+    return quantized
+
+
+def quantize_array_to_log2_codes(data: np.ndarray, levels: np.ndarray) -> np.ndarray:
+    """
+    Quantize numpy array to log2 level codes (integer indices).
+    
+    Args:
+        data: Input data array (should already be scaled to level range)
+        levels: Array of fixed log2 levels (e.g., [-8, -4, -2, -1, 0, 1, 2, 4, 8])
+    
+    Returns:
+        Integer codes corresponding to level indices
+    """
+    if data.size == 0:
+        return np.array([], dtype=np.int32)
+    
+    codes = np.zeros_like(data, dtype=np.int32)
+    zero_idx = len(levels) // 2  # Index of zero level
+    
+    for i, val in enumerate(data.flat):
+        # Find closest level index
+        distances = np.abs(levels - val)
+        closest_idx = np.argmin(distances)
+        codes.flat[i] = closest_idx - zero_idx  # Center around 0 for symmetric codes
+    
+    return codes
+
+
 def compute_scale_symmetric(data: np.ndarray, qmax: float, percentile: float = 100.0) -> float:
     """Compute symmetric quantization scale from data."""
     max_abs = np.percentile(np.abs(data), percentile)
@@ -51,20 +149,30 @@ def quantize_weights_by_scheme(
     scheme: str = "per_tensor",
     global_percentile: float = 100.0,
     return_codes: bool = False,
+    method: str = "linear",
+    num_log2_levels: int = 8,
 ) -> np.ndarray:
     """
     Quantize all .weight tensors in a state_dict according to the specified scheme.
     
     Args:
         state_dict: Dictionary of parameter tensors
-        bits: Bitwidth for quantization
+        bits: Bitwidth for quantization (ignored for log2 method)
         scheme: One of "per_channel", "per_tensor", "global"
         global_percentile: Percentile for global scheme scale computation
         return_codes: If True, return concatenated integer codes; if False, return scales
+        method: Quantization method - "linear" (default) or "log2"
+        num_log2_levels: Number of positive/negative levels for log2 quantization
         
     Returns:
         Concatenated numpy array of quantized integer codes (if return_codes=True)
     """
+    if method == "log2":
+        return _quantize_weights_log2_scheme(
+            state_dict, scheme, global_percentile, return_codes, num_log2_levels
+        )
+    
+    # Original linear quantization
     qmax = qmax_for_bits(bits)
     codes = []
     
@@ -118,6 +226,73 @@ def quantize_weights_by_scheme(
                 if return_codes:
                     q = quantize_array_to_codes(ch_data, scale, -qmax, qmax)
                     codes.append(q)
+        if not codes:
+            return np.array([], dtype=np.int32)
+        return np.concatenate(codes, axis=0) if return_codes else None
+
+
+def _quantize_weights_log2_scheme(
+    state_dict: Dict[str, torch.Tensor],
+    scheme: str,
+    global_percentile: float,
+    return_codes: bool,
+    num_log2_levels: int,
+) -> np.ndarray:
+    """Helper function for log2 quantization schemes."""
+    codes = []
+    
+    if scheme == "global":
+        # Collect all weights for global log2 levels
+        all_weights = []
+        for name, t in state_dict.items():
+            if isinstance(t, torch.Tensor) and t.dtype.is_floating_point and name.endswith(".weight"):
+                all_weights.append(t.cpu().numpy().ravel())
+        if not all_weights:
+            return np.array([], dtype=np.int32)
+        all_weights_arr = np.concatenate(all_weights, axis=0)
+        max_abs = np.percentile(np.abs(all_weights_arr), global_percentile)
+        levels, scale_factor = compute_log2_levels(max_abs, num_log2_levels)
+        quantized = quantize_to_log2(all_weights_arr, num_log2_levels, max_abs)
+        return quantized if return_codes else levels  # quantized is already integer codes
+    
+    elif scheme == "per_tensor":
+        for name, t in state_dict.items():
+            if not isinstance(t, torch.Tensor) or not t.dtype.is_floating_point:
+                continue
+            if not name.endswith(".weight"):
+                continue
+            w = t.cpu().numpy().ravel()
+            if return_codes:
+                max_abs = np.abs(w).max()
+                quantized = quantize_to_log2(w, num_log2_levels, max_abs)
+                codes.append(quantized)  # quantized is already integer codes
+        if not codes:
+            return np.array([], dtype=np.int32)
+        return np.concatenate(codes, axis=0) if return_codes else None
+    
+    else:  # per_channel
+        for name, t in state_dict.items():
+            if not isinstance(t, torch.Tensor) or not t.dtype.is_floating_point:
+                continue
+            if not name.endswith(".weight"):
+                continue
+            w = t.cpu().numpy()
+            if w.ndim < 2:
+                # fallback to per-tensor
+                w_flat = w.ravel()
+                if return_codes:
+                    max_abs = np.abs(w_flat).max()
+                    quantized = quantize_to_log2(w_flat, num_log2_levels, max_abs)
+                    codes.append(quantized)  # quantized is already integer codes
+                continue
+            # per-channel quantization
+            oc = w.shape[0]
+            w_flat = w.reshape(oc, -1)
+            for ch_data in w_flat:
+                if return_codes:
+                    max_abs = np.abs(ch_data).max()
+                    quantized = quantize_to_log2(ch_data, num_log2_levels, max_abs)
+                    codes.append(quantized)  # quantized is already integer codes
         if not codes:
             return np.array([], dtype=np.int32)
         return np.concatenate(codes, axis=0) if return_codes else None

@@ -116,7 +116,7 @@ def hist_with_counts(
     zeros, nonzeros = zero_nonzero_counts_from_array(arr, zero_threshold)
 
     plt.figure(figsize=(8, 5))
-    plt.hist(arr, bins=bins)
+    plt.hist(arr, bins=bins, edgecolor='black', linewidth=0.5)
     plt.title(title)
     plt.xlabel("value")
     plt.ylabel("count")
@@ -158,7 +158,7 @@ def overall_histogram(state_dict: Dict[str, torch.Tensor], outdir: str, bins: in
     zeros, nonzeros = zero_nonzero_counts_from_array(arr, zero_threshold)
 
     plt.figure(figsize=(9, 5))
-    plt.hist(arr, bins=bins)
+    plt.hist(arr, bins=bins, edgecolor='black', linewidth=0.5)
     plt.title(f"All weights histogram (float){suffix}")
     plt.xlabel("value")
     plt.ylabel("count")
@@ -206,6 +206,110 @@ def collect_weight_arrays(state_dict: Dict[str, torch.Tensor]) -> List[np.ndarra
 # -----------------------------
 # Multi-quant figure (integer-code hist for quantized variants)
 # -----------------------------
+def plot_log2_multi_levels(
+    state_dict: Dict[str, torch.Tensor],
+    outdir: str,
+    scheme: str,
+    bins_float: int,
+    zero_threshold: float,
+    show: bool,
+    global_percentile: float = 100.0,
+    log2_levels_list: List[int] = [4, 3, 2],
+):
+    """
+    Create a figure comparing float baseline with multiple log2 quantization levels.
+    Saves to weights_hist_log2_levels.png
+    """
+    ensure_dir(outdir)
+
+    # Base float weights (weights only, no biases)
+    float_arrs = collect_weight_arrays(state_dict)
+    if not float_arrs:
+        print("[WARN] No .weight tensors found; skipping log2 multi-levels histogram.")
+        return
+    float_arr = np.concatenate(float_arrs, axis=0)
+    f_zeros, f_nonzeros = zero_nonzero_counts_from_array(float_arr, zero_threshold)
+    variants = [("float (value)", float_arr, f_zeros, f_nonzeros, None)]
+
+    # Log2 quantized variants with different levels
+    for levels in log2_levels_list:
+        q_codes = quantize_weights_by_scheme(
+            state_dict=state_dict,
+            bits=8,  # ignored for log2
+            scheme=scheme,
+            global_percentile=global_percentile,
+            return_codes=True,
+            method="log2",
+            num_log2_levels=levels
+        )
+        # Create bins for power-of-2 levels
+        max_level = 2 ** levels
+        pos_levels = [2**i for i in range(levels + 1)]  # [1, 2, 4, ...]
+        neg_levels = [-x for x in reversed(pos_levels)]  # [..., -4, -2, -1]
+        all_levels = sorted(neg_levels + [0] + pos_levels)
+        
+        # Create bin edges properly centered on each level
+        # For level L, bin should be [L-0.5, L+0.5]
+        edges = []
+        for level in all_levels:
+            edges.extend([level - 0.5, level + 0.5])
+        # Remove duplicates and sort
+        edges = sorted(list(set(edges)))
+        edges = np.array(edges)
+        
+        q_zeros = int(np.count_nonzero(q_codes == 0))
+        q_nonzeros = int(q_codes.size - q_zeros)
+        title = f"log2-{levels}lvl (max=±{max_level})"
+        variants.append((title, q_codes, q_zeros, q_nonzeros, edges))
+
+    # Layout: 2x2 grid
+    fig, axes = plt.subplots(2, 2, figsize=(12, 9))
+    axes = axes.ravel()
+
+    for ax, (title, data, zeros, nonzeros, edges) in zip(axes, variants):
+        if edges is None:
+            # float value-domain histogram
+            ax.hist(data, bins=bins_float, edgecolor='black', linewidth=0.5)
+            ax.set_xlabel("value")
+        else:
+            # integer-code histogram with aligned bins
+            ax.hist(data, bins=edges, edgecolor='black', linewidth=0.7)
+            ax.set_xlabel("quantized level (integer code)")
+            # Set x-axis ticks to only show power-of-2 values
+            # Extract power-of-2 values from the title (e.g., "log2-4lvl" -> 4 levels)
+            if "log2" in title:
+                levels = int(title.split("-")[1].replace("lvl", "").split("(")[0])
+                max_level = 2 ** levels
+                pos_levels = [2**i for i in range(levels + 1)]
+                neg_levels = [-x for x in reversed(pos_levels)]
+                tick_positions = sorted(neg_levels + [0] + pos_levels)
+                ax.set_xticks(tick_positions)
+        ax.set_title(title)
+        ax.set_ylabel("count")
+        ax.grid(True, axis="y", alpha=0.3)
+
+        txt = (
+            f"total: {data.size}\n"
+            f"zero: {zeros}\n"
+            f"non-zero: {nonzeros}"
+        )
+        ax.text(
+            0.98, 0.95, txt,
+            transform=ax.transAxes,
+            ha="right", va="top",
+            bbox=dict(facecolor="white", alpha=0.8, edgecolor="none")
+        )
+
+    fig.suptitle(f"Log2 Quantization Comparison ({scheme}, {global_percentile}th percentile)", fontsize=14)
+    fig.tight_layout()
+    out_path = os.path.join(outdir, f"weights_hist_log2_levels_p{int(global_percentile)}.png")
+    plt.savefig(out_path, bbox_inches="tight")
+    if show:
+        plt.show()
+    plt.close(fig)
+    print(f"[OK] Saved {out_path}")
+
+
 def plot_multi_quant_histograms(
     state_dict: Dict[str, torch.Tensor],
     outdir: str,
@@ -215,6 +319,8 @@ def plot_multi_quant_histograms(
     zero_threshold: float,
     show: bool,
     global_percentile: float = 100.0,
+    method: str = "linear",
+    log2_levels: int = 4,
 ):
     """
     Create a figure with subplots:
@@ -235,18 +341,47 @@ def plot_multi_quant_histograms(
 
     # Quantized variants (integer codes)
     for b in bits_list:
-        qmax = qmax_for_bits(b)
-        q_codes = quantize_weights_by_scheme(
-            state_dict=state_dict,
-            bits=b,
-            scheme=scheme,
-            global_percentile=global_percentile,
-            return_codes=True
-        )
-        edges = np.arange(-qmax - 0.5, qmax + 1.5, 1.0)
+        if method == "log2":
+            q_codes = quantize_weights_by_scheme(
+                state_dict=state_dict,
+                bits=b,  # ignored for log2
+                scheme=scheme,
+                global_percentile=global_percentile,
+                return_codes=True,
+                method="log2",
+                num_log2_levels=log2_levels
+            )
+            # For log2, create bins for power-of-2 levels: 0, ±1, ±2, ±4, ±8, ±16
+            max_level = 2 ** log2_levels
+            pos_levels = [2**i for i in range(log2_levels + 1)]  # [1, 2, 4, 8, 16]
+            neg_levels = [-x for x in reversed(pos_levels)]      # [-16, -8, -4, -2, -1]
+            all_levels = sorted(neg_levels + [0] + pos_levels)   # [-16,-8,-4,-2,-1,0,1,2,4,8,16]
+            
+            # Create bin edges properly centered on each level
+            # For level L, bin should be [L-0.5, L+0.5]
+            edges = []
+            for level in all_levels:
+                edges.extend([level - 0.5, level + 0.5])
+            # Remove duplicates and sort
+            edges = sorted(list(set(edges)))
+            edges = np.array(edges)
+            title_suffix = f"log2-{log2_levels}lvl ({scheme})"
+        else:
+            # Original linear quantization (restore exact original logic)
+            qmax = qmax_for_bits(b)
+            q_codes = quantize_weights_by_scheme(
+                state_dict=state_dict,
+                bits=b,
+                scheme=scheme,
+                global_percentile=global_percentile,
+                return_codes=True
+            )
+            edges = np.arange(-qmax - 0.5, qmax + 1.5, 1.0)
+            title_suffix = f"{b}-bit ({scheme})"
+        
         q_zeros = int(np.count_nonzero(q_codes == 0))
         q_nonzeros = int(q_codes.size - q_zeros)
-        variants.append((f"{b}-bit ({scheme})", q_codes, q_zeros, q_nonzeros, edges))
+        variants.append((title_suffix, q_codes, q_zeros, q_nonzeros, edges))
 
     # Layout
     n = len(variants)
@@ -258,12 +393,21 @@ def plot_multi_quant_histograms(
     for ax, (title, data, zeros, nonzeros, edges) in zip(axes, variants):
         if edges is None:
             # float value-domain histogram
-            ax.hist(data, bins=bins_float)
+            ax.hist(data, bins=bins_float, edgecolor='black', linewidth=0.5)
             ax.set_xlabel("value")
         else:
             # integer-code histogram with aligned bins
-            ax.hist(data, bins=edges)
+            ax.hist(data, bins=edges, edgecolor='black', linewidth=0.7)
             ax.set_xlabel("quantized level (integer code)")
+            # Set x-axis ticks to only show power-of-2 values for log2 method
+            if "log2" in title:
+                # Extract levels from title (e.g., "log2-4lvl" -> 4 levels)
+                levels = int(title.split("-")[1].replace("lvl", "").split("(")[0])
+                max_level = 2 ** levels
+                pos_levels = [2**i for i in range(levels + 1)]
+                neg_levels = [-x for x in reversed(pos_levels)]
+                tick_positions = sorted(neg_levels + [0] + pos_levels)
+                ax.set_xticks(tick_positions)
         ax.set_title(title)
         ax.set_ylabel("count")
         ax.grid(True, axis="y", alpha=0.3)
@@ -285,7 +429,7 @@ def plot_multi_quant_histograms(
         ax.axis("off")
 
     fig.tight_layout()
-    out_path = os.path.join(outdir, "weights_hist_multi_quant.png")
+    out_path = os.path.join(outdir, f"weights_hist_multi_quant_{method}_p{int(global_percentile)}.png")
     plt.savefig(out_path, bbox_inches="tight")
     if show:
         plt.show()
@@ -303,7 +447,7 @@ def plot_actual_quantized_weights(state_dict, outdir, show=False):
         ):
             arr = tensor.int_repr().cpu().numpy().ravel()
             plt.figure(figsize=(8, 5))
-            plt.hist(arr, bins=np.arange(arr.min()-0.5, arr.max()+1.5, 1), color='C0')
+            plt.hist(arr, bins=np.arange(arr.min()-0.5, arr.max()+1.5, 1), color='C0', edgecolor='black', linewidth=0.7)
             plt.title(f"{name} (actual quantized codes)")
             plt.xlabel("quantized integer code")
             plt.ylabel("count")
@@ -368,6 +512,19 @@ def parse_bits_list(bits_str: str) -> List[int]:
     return bits
 
 
+def parse_levels_list(levels_str: str) -> List[int]:
+    levels = []
+    for s in levels_str.split(","):
+        s = s.strip()
+        if not s:
+            continue
+        level = int(s)
+        if level < 1 or level > 10:
+            raise ValueError("Log2 levels must be integers in [1..10].")
+        levels.append(level)
+    return levels
+
+
 def main():
     # --- Print all bias parameters with summary ---
     
@@ -384,6 +541,10 @@ def main():
                         help="Weight quantization scheme for the multi-quant figure.")
     parser.add_argument("--global-percentile", type=float, default=100.0,
                         help="Percentile for global quantization scale (default: 100, i.e. max).")
+    parser.add_argument("--quant-method", type=str, choices=["linear", "log2"], default="linear",
+                        help="Quantization method: 'linear' (traditional) or 'log2' (power-of-2 levels).")
+    parser.add_argument("--log2-levels", type=str, default="4",
+                        help="Number of levels for log2 quantization (max level = 2^levels). Can be comma-separated for multiple comparisons, e.g., '8,4,3'.")
     parser.add_argument("--per-layer", action="store_true",
                         help="If set, save per-parameter (layer) histograms. Default: off.")
     args = parser.parse_args()
@@ -463,29 +624,48 @@ def main():
             plot_per_layer_histograms(sd, args.outdir, bins=args.bins, zero_threshold=args.zero_threshold, show=args.show)
 
         bits_list = parse_bits_list(args.quant_bits)
+        levels_list = parse_levels_list(args.log2_levels)
         if bits_list:
-            for b in bits_list:
-                q_codes = quantize_weights_by_scheme(
-                    state_dict=sd,
-                    bits=b,
+            # For log2 method, only generate the multi-levels comparison
+            if args.quant_method == "log2":
+                plot_log2_multi_levels(
+                    state_dict=sd_folded,
+                    outdir=args.outdir,
                     scheme=args.quant_scheme,
+                    bins_float=args.bins,
+                    zero_threshold=args.zero_threshold,
+                    show=args.show,
                     global_percentile=args.global_percentile,
-                    return_codes=True
+                    log2_levels_list=levels_list,
                 )
-                if q_codes.size > 0:
-                    print(f"[QUANTIZED {b}-bit {args.quant_scheme}] min={q_codes.min()} max={q_codes.max()}")
-                else:
-                    print(f"[QUANTIZED {b}-bit {args.quant_scheme}] No quantized codes found.")
-            plot_multi_quant_histograms(
-                state_dict=sd,
-                outdir=args.outdir,
-                bits_list=bits_list,
-                scheme=args.quant_scheme,
-                bins_float=args.bins,
-                zero_threshold=args.zero_threshold,
-                show=args.show,
-                global_percentile=args.global_percentile,
-            )
+            else:
+                # For linear method, generate the traditional multi-quant plot
+                for b in bits_list:
+                    q_codes = quantize_weights_by_scheme(
+                        state_dict=sd_folded,
+                        bits=b,
+                        scheme=args.quant_scheme,
+                        global_percentile=args.global_percentile,
+                        return_codes=True,
+                        **({"method": args.quant_method, "num_log2_levels": args.log2_levels} if args.quant_method == "log2" else {})
+                    )
+                    if q_codes.size > 0:
+                        method_desc = f"{args.quant_method}" + (f"-{args.log2_levels}lvl" if args.quant_method == "log2" else f"-{b}bit")
+                        print(f"[QUANTIZED {method_desc} {args.quant_scheme}] min={q_codes.min()} max={q_codes.max()}")
+                    else:
+                        print(f"[QUANTIZED {args.quant_method} {args.quant_scheme}] No quantized codes found.")
+                plot_multi_quant_histograms(
+                    state_dict=sd_folded,
+                    outdir=args.outdir,
+                    bits_list=bits_list,
+                    scheme=args.quant_scheme,
+                    bins_float=args.bins,
+                    zero_threshold=args.zero_threshold,
+                    show=args.show,
+                    global_percentile=args.global_percentile,
+                    method=args.quant_method,
+                    log2_levels=levels_list[0] if levels_list else 4,
+                )
         else:
             print("[INFO] No quant bits requested; skipped multi-quant figure.")
 

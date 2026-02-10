@@ -116,7 +116,7 @@ class Trainer:
         self.test_confusion = None  # (only for multiclass)
         # Histories / outputs
         self.epochs = int(cfg["train"]["num_epochs"])
-        self.plots_dir = cfg["output"]["plots_dir"] + "/training"
+        self.plots_dir = os.path.join(cfg["output"]["plots_dir"], "training")
         self.metrics_figure = os.path.join(self.plots_dir, "metrics.png")
         self.weights_path = os.path.join(cfg["output"]["weights_dir"], "model_weights_fp.pt")
         self.ckpt_path    = os.path.join(cfg["output"]["weights_dir"], "model_ckpt_fp.pt")
@@ -127,6 +127,21 @@ class Trainer:
         # CSV logging path
         self.csv_path = os.path.join(self.plots_dir, "metrics.csv")
         self._init_csv_log()
+
+        # Early stopping configuration
+        early_stop_cfg = cfg["train"].get("early_stopping", {})
+        self.early_stopping_enabled = bool(early_stop_cfg.get("enabled", False))
+        self.early_stopping_patience = int(early_stop_cfg.get("patience", 10))
+        self.early_stopping_metric = str(early_stop_cfg.get("metric", "val_loss"))
+        self.early_stopping_min_delta = float(early_stop_cfg.get("min_delta", 0.001))
+        self.early_stopping_restore_best = bool(early_stop_cfg.get("restore_best", True))
+        
+        # Early stopping state
+        self.best_metric_value = None
+        self.best_epoch = 0
+        self.epochs_without_improvement = 0
+        self.best_model_state = None
+        self.early_stopped = False
 
         # ---- Sanity checks: dataset sizes and feature shapes ----
         print(f"[Split sizes] train={len(self.train_dataset)}  val={len(self.val_dataset)}  test={len(self.test_dataset)}")
@@ -252,6 +267,55 @@ class Trainer:
             pin_memory=self.pin_memory
         )
  
+    def _check_early_stopping(self, va_loss: float, va_acc: float, va_f1: float, epoch: int) -> bool:
+        """Check if early stopping criteria are met. Returns True if training should stop."""
+        if not self.early_stopping_enabled:
+            return False
+            
+        # Get current metric value based on configured metric
+        if self.early_stopping_metric == "val_loss":
+            current_value = va_loss
+            is_better = lambda curr, best: curr < best - self.early_stopping_min_delta
+        elif self.early_stopping_metric == "val_acc":
+            current_value = va_acc
+            is_better = lambda curr, best: curr > best + self.early_stopping_min_delta
+        elif self.early_stopping_metric == "val_f1":
+            current_value = va_f1
+            is_better = lambda curr, best: curr > best + self.early_stopping_min_delta
+        else:
+            print(f"[WARNING] Unknown early stopping metric: {self.early_stopping_metric}. Disabling early stopping.")
+            return False
+            
+        # Initialize best value on first epoch
+        if self.best_metric_value is None:
+            self.best_metric_value = current_value
+            self.best_epoch = epoch
+            self.epochs_without_improvement = 0
+            if self.early_stopping_restore_best:
+                self.best_model_state = deepcopy(self.model.state_dict())
+            return False
+            
+        # Check if current value is better than best
+        if is_better(current_value, self.best_metric_value):
+            self.best_metric_value = current_value
+            self.best_epoch = epoch
+            self.epochs_without_improvement = 0
+            if self.early_stopping_restore_best:
+                self.best_model_state = deepcopy(self.model.state_dict())
+            print(f"[Early Stopping] New best {self.early_stopping_metric}: {current_value:.4f} at epoch {epoch}")
+        else:
+            self.epochs_without_improvement += 1
+            
+        # Check if patience exceeded
+        if self.epochs_without_improvement >= self.early_stopping_patience:
+            print(f"[Early Stopping] No improvement for {self.early_stopping_patience} epochs. Best {self.early_stopping_metric}: {self.best_metric_value:.4f} at epoch {self.best_epoch}")
+            if self.early_stopping_restore_best and self.best_model_state is not None:
+                print(f"[Early Stopping] Restoring best model weights from epoch {self.best_epoch}")
+                self.model.load_state_dict(self.best_model_state)
+            return True
+            
+        return False
+
     def train(self) -> None:
         start = time.perf_counter()
         for epoch in range(1, self.epochs + 1):
@@ -270,9 +334,20 @@ class Trainer:
             # CSV logging per epoch
             self._append_csv_log(epoch, tr_loss, tr_acc, tr_p, tr_r, tr_f1, va_loss, va_acc, va_p, va_r, va_f1)
 
+            # Check early stopping
+            if self._check_early_stopping(va_loss, va_acc, va_f1, epoch):
+                self.early_stopped = True
+                print(f"[Early Stopping] Training stopped at epoch {epoch}")
+                break
+
         elapsed = time.perf_counter() - start
+        final_epoch = len(self.train_hist['loss'])
         hrs, rem = divmod(int(elapsed), 3600)
         mins, secs = divmod(rem, 60)
+        if self.early_stopped:
+            print(f"[Early Stopping] Training stopped early at epoch {final_epoch}/{self.epochs}")
+        else:
+            print(f"Training completed all {final_epoch} epochs")
         print(f"Total training time: {hrs:02d}:{mins:02d}:{secs:02d} (hh:mm:ss)")
 
         # Optional: auto threshold tuning (binary)
@@ -306,6 +381,11 @@ class Trainer:
             self.test_confusion = cm  # numpy array
 
     def save(self) -> None:
+        # Create directories if they don't exist
+        os.makedirs(os.path.dirname(self.weights_path), exist_ok=True)
+        os.makedirs(os.path.dirname(self.ckpt_path), exist_ok=True)
+        os.makedirs(self.plots_dir, exist_ok=True)
+        
         # Always save plain weights (state_dict) for simple loading
         torch.save(self.model.state_dict(), self.weights_path)
         print(f"Weights saved to {self.weights_path}")
@@ -314,7 +394,11 @@ class Trainer:
         ckpt = {
             "state_dict": self.model.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-            "epoch": self.epochs,
+            "epoch": len(self.train_hist['loss']) if self.early_stopped else self.epochs,
+            "early_stopped": getattr(self, "early_stopped", False),
+            "best_epoch": getattr(self, "best_epoch", None),
+            "best_metric_value": getattr(self, "best_metric_value", None),
+            "early_stopping_metric": getattr(self, "early_stopping_metric", None),
             "cfg": self.cfg,
             "task_type": self.task_type,
             "num_classes": self.num_classes,

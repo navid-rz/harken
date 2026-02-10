@@ -52,7 +52,8 @@ def preprocess_wave(y: np.ndarray, sr: int, cfg_mfcc: dict, fixed_duration_s: fl
     else:
         y = y[:target_len]
 
-    n_mfcc = int(cfg_mfcc["n_mfcc"])
+    # Support both n_mfcc and n_features naming
+    n_mfcc = int(cfg_mfcc.get("n_mfcc", cfg_mfcc.get("n_features", 28)))
     frame_length_s = float(cfg_mfcc["frame_length_s"])
     hop_length_s = float(cfg_mfcc["hop_length_s"])
     n_fft = int(round(frame_length_s * sr))

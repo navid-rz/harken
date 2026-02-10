@@ -48,6 +48,42 @@
   torch.save(model.state_dict(), 'checkpoints/model_bn_folded.pt')
   ```
 
+**Weight Visualization and Analysis**
+- **Basic weight histograms (all models):**
+  ```bash
+  # Generate histograms for original and BatchNorm-folded weights
+  python -m analysis.plot_weights --path checkpoints/logmel16_agc/model_weights_fp.pt --outdir plots/logmel16_agc/weights
+  python -m analysis.plot_weights --path checkpoints/logmel40_unnorm/model_weights_fp.pt --outdir plots/logmel40_unnorm/weights
+  python -m analysis.plot_weights --path checkpoints/mfcc28_agc/model_weights_fp.pt --outdir plots/mfcc28_agc/weights
+  ```
+
+- **Multi-quantization analysis with different schemes:**
+  ```bash
+  # Per-tensor quantization (default) with 99.9th percentile scale
+  python -m analysis.plot_weights --path checkpoints/model_weights_fp.pt --outdir plots/weights --quant-bits 8,4,3 --quant-scheme per_tensor --global-percentile 99.9
+
+  # Global quantization (single scale for all weights) with max scale
+  python -m analysis.plot_weights --path checkpoints/model_weights_fp.pt --outdir plots/weights --quant-bits 8,4,3 --quant-scheme global --global-percentile 100.0
+
+  # Per-channel quantization (best accuracy) with 99th percentile
+  python -m analysis.plot_weights --path checkpoints/model_weights_fp.pt --outdir plots/weights --quant-bits 8,4,3 --quant-scheme per_channel --global-percentile 99.0
+  ```
+
+- **Quantization scheme comparison:**
+  - **`per_tensor`** (default): One scale per weight tensor - good balance of accuracy and simplicity
+  - **`global`**: Single scale across ALL weight tensors - most hardware-friendly, potentially lower accuracy
+  - **`per_channel`**: One scale per output channel - best accuracy, more complex hardware implementation
+
+- **Percentile scale selection:**
+  - **`100.0`** (default): Uses maximum absolute value for scaling
+  - **`99.9`**: Ignores extreme outliers, often improves quantization quality
+  - **`99.0`**: More aggressive outlier removal, may help with noisy weight distributions
+
+- **Output files generated:**
+  - `all_weights_hist.png` - Histogram of original floating-point weights
+  - `all_weights_hist_folded.png` - Histogram after BatchNorm folding (more representative for deployment)
+  - `weights_hist_multi_quant.png` - Multi-panel quantization analysis (uses folded weights)
+
 **Weight visualization**
 - **Overall + multi-quant (global):**
   python -m analysis.plot_weights --path checkpoints/model_ckpt_fp.pt --outdir plots/weights_viz --quant-bits 8,4,3 --quant-scheme global --global-percentile 90

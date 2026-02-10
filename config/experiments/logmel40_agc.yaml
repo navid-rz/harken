@@ -38,7 +38,7 @@ model:
   num_blocks: 4
   causal: true
   activation: relu
-  norm: none
+  norm: batch
   groups_for_groupnorm: 8
   depthwise_separable: false
   weight_norm: false
@@ -47,7 +47,7 @@ model:
   bias: false
 
 train:
-  num_epochs: 50
+  num_epochs: 100
   batch_size: 256
   learning_rate: 0.0003
   weight_decay: 0.00001
@@ -58,6 +58,14 @@ train:
   threshold_search_steps: 101
   class_weights: null
   label_smoothing: 0.0
+
+  # Early stopping configuration
+  early_stopping:
+    enabled: true
+    patience: 10             # Stop if no improvement for 10 epochs
+    metric: "val_loss"        # Monitor validation loss
+    min_delta: 0.001         # Minimum change to qualify as improvement
+    restore_best: true       # Load best weights before stopping
 
 output:
   weights_dir: "checkpoints/logmel40_agc"
