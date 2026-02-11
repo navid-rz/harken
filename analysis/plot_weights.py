@@ -202,6 +202,67 @@ def collect_weight_arrays(state_dict: Dict[str, torch.Tensor]) -> List[np.ndarra
     return arrs
 
 
+def convert_log2_weights_to_codes(quantized_weights: np.ndarray, num_levels: int) -> np.ndarray:
+    """
+    Convert log2 quantized weight values to integer level codes for plotting.
+    
+    For normalized weights (normalize_to_unit=True), the quantized weights are in [-1, +1] range
+    where each level corresponds to a power-of-2 fraction of the maximum level.
+    
+    Args:
+        quantized_weights: Array of quantized weight values (may be normalized to [-1,+1])
+        num_levels: Number of log2 levels used for quantization
+    
+    Returns:
+        Integer codes corresponding to the log2 levels
+    """
+    # Create the same levels array used in quantization
+    pos_levels = np.array([2**i for i in range(num_levels)])  # [1, 2, 4, 8] for num_levels=4
+    neg_levels = -pos_levels[::-1]  # [-8, -4, -2, -1] for num_levels=4
+    levels = np.concatenate([neg_levels, [0], pos_levels])  # [-8,-4,-2,-1,0,1,2,4,8]
+    
+    # Handle the normalized case (normalize_to_unit=True)
+    max_level = pos_levels[-1]  # Maximum positive level (e.g., 8 for num_levels=4)
+    max_quantized = np.abs(quantized_weights).max()
+    
+    codes = np.zeros_like(quantized_weights, dtype=np.int32)
+    
+    if max_quantized <= 1.0:
+        # This looks like normalized output (normalize_to_unit=True)
+        # Map normalized values back to integer level codes
+        for i, weight in enumerate(quantized_weights.flat):
+            if abs(weight) < 1e-10:  # Effectively zero
+                codes.flat[i] = 0
+            else:
+                # Convert normalized weight back to level
+                # For normalize_to_unit=True: quantized_weight = level / max_level
+                # So: level = quantized_weight * max_level
+                level = weight * max_level
+                # Find the closest integer level
+                closest_level_idx = np.argmin(np.abs(levels - level))
+                codes.flat[i] = levels[closest_level_idx]
+    else:
+        # This is not normalized output, find scale factor
+        # Find the scale factor by looking at the ratio between quantized values and expected levels
+        # The max quantized weight should correspond to the max level
+        scale_factor = max_quantized / max_level
+        
+        # Convert quantized weights to integer codes
+        for i, weight in enumerate(quantized_weights.flat):
+            if weight == 0:
+                codes.flat[i] = 0
+            else:
+                # Find closest level in the unscaled domain
+                unscaled_weight = weight / scale_factor
+                distances = np.abs(levels - unscaled_weight)
+                closest_idx = np.argmin(distances)
+                codes.flat[i] = int(levels[closest_idx])
+    
+    return codes
+    
+    return codes
+
+
 
 # -----------------------------
 # Multi-quant figure (integer-code hist for quantized variants)
@@ -215,6 +276,7 @@ def plot_log2_multi_levels(
     show: bool,
     global_percentile: float = 100.0,
     log2_levels_list: List[int] = [4, 3, 2],
+    normalize_to_unit: bool = False,
 ):
     """
     Create a figure comparing float baseline with multiple log2 quantization levels.
@@ -233,19 +295,24 @@ def plot_log2_multi_levels(
 
     # Log2 quantized variants with different levels
     for levels in log2_levels_list:
-        q_codes = quantize_weights_by_scheme(
+        # Get quantized weights (actual values, not codes)
+        quantized_weights = quantize_weights_by_scheme(
             state_dict=state_dict,
             bits=8,  # ignored for log2
             scheme=scheme,
             global_percentile=global_percentile,
             return_codes=True,
             method="log2",
-            num_log2_levels=levels
+            num_log2_levels=levels,
+            normalize_to_unit=normalize_to_unit
         )
+        # Convert quantized weights to integer codes for plotting
+        q_codes = convert_log2_weights_to_codes(quantized_weights, levels)
+        
         # Create bins for power-of-2 levels
-        max_level = 2 ** levels
-        pos_levels = [2**i for i in range(levels + 1)]  # [1, 2, 4, ...]
-        neg_levels = [-x for x in reversed(pos_levels)]  # [..., -4, -2, -1]
+        max_level = 2 ** (levels - 1)  # Corrected: for levels=4, max_level=8
+        pos_levels = [2**i for i in range(levels)]  # [1, 2, 4, 8] for levels=4
+        neg_levels = [-x for x in reversed(pos_levels)]  # [-8, -4, -2, -1]
         all_levels = sorted(neg_levels + [0] + pos_levels)
         
         # Create bin edges properly centered on each level
@@ -321,6 +388,7 @@ def plot_multi_quant_histograms(
     global_percentile: float = 100.0,
     method: str = "linear",
     log2_levels: int = 4,
+    normalize_to_unit: bool = False,
 ):
     """
     Create a figure with subplots:
@@ -342,20 +410,25 @@ def plot_multi_quant_histograms(
     # Quantized variants (integer codes)
     for b in bits_list:
         if method == "log2":
-            q_codes = quantize_weights_by_scheme(
+            # Get quantized weights (actual values, not codes)
+            quantized_weights = quantize_weights_by_scheme(
                 state_dict=state_dict,
                 bits=b,  # ignored for log2
                 scheme=scheme,
                 global_percentile=global_percentile,
                 return_codes=True,
                 method="log2",
-                num_log2_levels=log2_levels
+                num_log2_levels=log2_levels,
+                normalize_to_unit=normalize_to_unit
             )
-            # For log2, create bins for power-of-2 levels: 0, ±1, ±2, ±4, ±8, ±16
-            max_level = 2 ** log2_levels
-            pos_levels = [2**i for i in range(log2_levels + 1)]  # [1, 2, 4, 8, 16]
-            neg_levels = [-x for x in reversed(pos_levels)]      # [-16, -8, -4, -2, -1]
-            all_levels = sorted(neg_levels + [0] + pos_levels)   # [-16,-8,-4,-2,-1,0,1,2,4,8,16]
+            # Convert quantized weights to integer codes for plotting
+            q_codes = convert_log2_weights_to_codes(quantized_weights, log2_levels)
+            
+            # For log2, create bins for power-of-2 levels: 0, ±1, ±2, ±4, ±8
+            max_level = 2 ** (log2_levels - 1)  # Corrected: for log2_levels=4, max_level=8
+            pos_levels = [2**i for i in range(log2_levels)]  # [1, 2, 4, 8] for log2_levels=4
+            neg_levels = [-x for x in reversed(pos_levels)]      # [-8, -4, -2, -1]
+            all_levels = sorted(neg_levels + [0] + pos_levels)   # [-8,-4,-2,-1,0,1,2,4,8]
             
             # Create bin edges properly centered on each level
             # For level L, bin should be [L-0.5, L+0.5]
@@ -374,7 +447,8 @@ def plot_multi_quant_histograms(
                 bits=b,
                 scheme=scheme,
                 global_percentile=global_percentile,
-                return_codes=True
+                return_codes=True,
+                normalize_to_unit=normalize_to_unit
             )
             edges = np.arange(-qmax - 0.5, qmax + 1.5, 1.0)
             title_suffix = f"{b}-bit ({scheme})"
@@ -545,6 +619,8 @@ def main():
                         help="Quantization method: 'linear' (traditional) or 'log2' (power-of-2 levels).")
     parser.add_argument("--log2-levels", type=str, default="4",
                         help="Number of levels for log2 quantization (max level = 2^levels). Can be comma-separated for multiple comparisons, e.g., '8,4,3'.")
+    parser.add_argument("--normalize-to-unit", action="store_true",
+                        help="Normalize quantized weights to [-1, +1] range before converting to integer codes.")
     parser.add_argument("--per-layer", action="store_true",
                         help="If set, save per-parameter (layer) histograms. Default: off.")
     args = parser.parse_args()

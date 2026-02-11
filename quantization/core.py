@@ -27,57 +27,69 @@ def compute_log2_levels(max_abs_val: float, num_levels: int = 8) -> tuple[np.nda
         levels = np.array([0])
         return levels, 1.0
     
-    # Create fixed power-of-2 levels: ±1, ±2, ±4, ±8, ... ±2^num_levels
-    max_level = 2 ** num_levels  # e.g., if num_levels=4, max_level=16
-    pos_levels = np.array([2**i for i in range(num_levels + 1)])  # [1, 2, 4, 8, 16]
+    # Create fixed power-of-2 levels: ±1, ±2, ±4, ±8, ... up to num_levels
+    pos_levels = np.array([2**i for i in range(num_levels)])  # [1, 2, 4, 8] for num_levels=4
     
     # Full level set: negative levels, zero, positive levels
-    neg_levels = -pos_levels[::-1]  # [-16, -8, -4, -2, -1]
-    levels = np.concatenate([neg_levels, [0], pos_levels])  # [-16,-8,-4,-2,-1,0,1,2,4,8,16]
+    neg_levels = -pos_levels[::-1]  # [-8, -4, -2, -1] for num_levels=4
+    levels = np.concatenate([neg_levels, [0], pos_levels])  # [-8,-4,-2,-1,0,1,2,4,8]
     
-    # Compute scale factor: scale weights so max_abs_val maps to max_level (2^num_levels)
+    # Compute scale factor: scale weights so max_abs_val maps to max level
+    max_level = pos_levels[-1]  # Maximum positive level (e.g., 8 for num_levels=4)
     scale_factor = max_abs_val / max_level
     
     return levels, scale_factor
 
 
-def quantize_to_log2(data: np.ndarray, num_levels: int = 8, max_abs_val: Optional[float] = None) -> np.ndarray:
+def quantize_to_log2(data: np.ndarray, num_levels: int = 8, max_abs_val: Optional[float] = None, 
+                    normalize_to_unit: bool = False) -> np.ndarray:
     """
-    Quantize data to fixed log2 integer levels for hardware implementation.
+    Quantize data to fixed log2 levels for hardware implementation.
     
     Args:
         data: Input data to quantize
-        num_levels: Number of levels determines max level as 2^num_levels
+        num_levels: Number of levels determines available powers of 2: [1, 2, 4, ..., 2^(num_levels-1)]
         max_abs_val: Maximum absolute value for scaling (if None, use data max)
+        normalize_to_unit: If True, normalize output to [-1, +1] range for hardware
     
     Returns:
-        Quantized integer levels: values like [-16, -8, -4, -2, -1, 0, 1, 2, 4, 8, 16]
+        Quantized data in original scale (or [-1,+1] if normalize_to_unit=True)
     """
     if data.size == 0:
-        return data.copy().astype(np.int32)
+        return data.copy().astype(np.float32)
     
     if max_abs_val is None:
         max_abs_val = np.abs(data).max()
     
     if max_abs_val == 0:
-        return np.zeros_like(data, dtype=np.int32)
+        return np.zeros_like(data, dtype=np.float32)
     
     # Get fixed levels and scale factor
     levels, scale_factor = compute_log2_levels(max_abs_val, num_levels)
     
+    # Get the maximum level for normalization
+    max_level = 2 ** (num_levels - 1)  # e.g., for num_levels=4: 2^3 = 8
+    
     # Scale data to fit the fixed levels
     scaled_data = data / scale_factor
     
-    # Quantize to nearest fixed level (return the integer levels directly)
-    quantized = np.zeros_like(scaled_data, dtype=np.int32)
+    # Quantize to nearest fixed level
+    quantized = np.zeros_like(scaled_data, dtype=np.float32)
     for i, val in enumerate(scaled_data.flat):
         if val == 0:
-            quantized.flat[i] = 0
+            quantized.flat[i] = 0.0
         else:
             # Find closest level by minimizing absolute difference
             distances = np.abs(levels - val)
             closest_idx = np.argmin(distances)
-            quantized.flat[i] = int(levels[closest_idx])  # Return the integer level
+            closest_level = levels[closest_idx]
+            
+            if normalize_to_unit:
+                # Normalize to [-1, +1] range for hardware deployment
+                quantized.flat[i] = closest_level / max_level
+            else:
+                # Scale back to original magnitude
+                quantized.flat[i] = closest_level * scale_factor
     
     return quantized
 
@@ -123,16 +135,27 @@ def compute_scale_asymmetric(data: np.ndarray, qmin: float, qmax: float, percent
     return scale, zero_point
 
 
-def quantize_tensor(data: torch.Tensor, scale: float, zero_point: float, qmin: float, qmax: float) -> torch.Tensor:
-    """Quantize and dequantize a tensor: data -> q*scale."""
+def quantize_tensor(data: torch.Tensor, scale: float, zero_point: float, qmin: float, qmax: float, 
+                    normalize_to_unit: bool = False) -> torch.Tensor:
+    """Quantize and dequantize a tensor."""
     if zero_point == 0:
         # Symmetric
         q = torch.clamp(torch.round(data / scale), qmin, qmax)
-        return q * scale
+        if normalize_to_unit:
+            # Normalize to [-1, +1] range for hardware deployment
+            return q / qmax
+        else:
+            # Return in original scale
+            return q * scale
     else:
         # Asymmetric
         q = torch.clamp(torch.round(data / scale + zero_point), qmin, qmax)
-        return (q - zero_point) * scale
+        if normalize_to_unit:
+            # Normalize to [-1, +1] range (asymmetric case more complex)
+            q_centered = q - zero_point
+            return q_centered / max(abs(qmin), abs(qmax))
+        else:
+            return (q - zero_point) * scale
 
 
 def quantize_array_to_codes(data: np.ndarray, scale: float, qmin: float, qmax: float) -> np.ndarray:
@@ -151,6 +174,7 @@ def quantize_weights_by_scheme(
     return_codes: bool = False,
     method: str = "linear",
     num_log2_levels: int = 8,
+    normalize_to_unit: bool = False,
 ) -> np.ndarray:
     """
     Quantize all .weight tensors in a state_dict according to the specified scheme.
@@ -163,13 +187,14 @@ def quantize_weights_by_scheme(
         return_codes: If True, return concatenated integer codes; if False, return scales
         method: Quantization method - "linear" (default) or "log2"
         num_log2_levels: Number of positive/negative levels for log2 quantization
+        normalize_to_unit: If True, normalize quantized weights to [-1, +1] range
         
     Returns:
         Concatenated numpy array of quantized integer codes (if return_codes=True)
     """
     if method == "log2":
         return _quantize_weights_log2_scheme(
-            state_dict, scheme, global_percentile, return_codes, num_log2_levels
+            state_dict, scheme, global_percentile, return_codes, num_log2_levels, normalize_to_unit
         )
     
     # Original linear quantization
@@ -237,6 +262,7 @@ def _quantize_weights_log2_scheme(
     global_percentile: float,
     return_codes: bool,
     num_log2_levels: int,
+    normalize_to_unit: bool = False,
 ) -> np.ndarray:
     """Helper function for log2 quantization schemes."""
     codes = []
@@ -252,7 +278,7 @@ def _quantize_weights_log2_scheme(
         all_weights_arr = np.concatenate(all_weights, axis=0)
         max_abs = np.percentile(np.abs(all_weights_arr), global_percentile)
         levels, scale_factor = compute_log2_levels(max_abs, num_log2_levels)
-        quantized = quantize_to_log2(all_weights_arr, num_log2_levels, max_abs)
+        quantized = quantize_to_log2(all_weights_arr, num_log2_levels, max_abs, normalize_to_unit)
         return quantized if return_codes else levels  # quantized is already integer codes
     
     elif scheme == "per_tensor":
@@ -264,7 +290,7 @@ def _quantize_weights_log2_scheme(
             w = t.cpu().numpy().ravel()
             if return_codes:
                 max_abs = np.abs(w).max()
-                quantized = quantize_to_log2(w, num_log2_levels, max_abs)
+                quantized = quantize_to_log2(w, num_log2_levels, max_abs, normalize_to_unit)
                 codes.append(quantized)  # quantized is already integer codes
         if not codes:
             return np.array([], dtype=np.int32)
@@ -282,7 +308,7 @@ def _quantize_weights_log2_scheme(
                 w_flat = w.ravel()
                 if return_codes:
                     max_abs = np.abs(w_flat).max()
-                    quantized = quantize_to_log2(w_flat, num_log2_levels, max_abs)
+                    quantized = quantize_to_log2(w_flat, num_log2_levels, max_abs, normalize_to_unit)
                     codes.append(quantized)  # quantized is already integer codes
                 continue
             # per-channel quantization
@@ -291,7 +317,7 @@ def _quantize_weights_log2_scheme(
             for ch_data in w_flat:
                 if return_codes:
                     max_abs = np.abs(ch_data).max()
-                    quantized = quantize_to_log2(ch_data, num_log2_levels, max_abs)
+                    quantized = quantize_to_log2(ch_data, num_log2_levels, max_abs, normalize_to_unit)
                     codes.append(quantized)  # quantized is already integer codes
         if not codes:
             return np.array([], dtype=np.int32)
@@ -303,10 +329,14 @@ def quantize_model_weights(
     bits: int = 8,
     scheme: str = "per_tensor",
     symmetric: bool = True,
-    global_percentile: float = 100.0
+    global_percentile: float = 100.0,
+    normalize_to_unit: bool = False
 ) -> torch.nn.Module:
     """
     Quantize weights of all Conv1d/Linear layers in the model using the specified scheme.
+    
+    Args:
+        normalize_to_unit: If True, normalize quantized weights to [-1,+1] range for hardware
     """
     model = model.cpu()
     if symmetric:
@@ -331,7 +361,7 @@ def quantize_model_weights(
                 scale, zero_point = compute_scale_asymmetric(all_weights_np, qmin, qmax_w, global_percentile)
             for _, module in model.named_modules():
                 if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
-                    module.weight.data = quantize_tensor(module.weight.data, scale, zero_point, qmin, qmax_w)
+                    module.weight.data = quantize_tensor(module.weight.data, scale, zero_point, qmin, qmax_w, normalize_to_unit)
     elif scheme == "per_channel":
         for _, module in model.named_modules():
             if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
@@ -344,7 +374,7 @@ def quantize_model_weights(
                         zero_point = 0
                     else:
                         scale, zero_point = compute_scale_asymmetric(w_np, qmin, qmax_w)
-                    module.weight.data = quantize_tensor(w, scale, zero_point, qmin, qmax_w)
+                    module.weight.data = quantize_tensor(w, scale, zero_point, qmin, qmax_w, normalize_to_unit)
                     continue
                 oc = w.shape[0]
                 w_flat = w.view(oc, -1)
