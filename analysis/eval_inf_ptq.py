@@ -13,6 +13,7 @@ from config import load_config
 from inference.model import KeywordModel
 from data_loader.utils import make_datasets
 from quantization.core import quantize_model_weights, quantize_to_log2
+from tqdm import tqdm
 
 
 def apply_log2_quantization(model: nn.Module, num_levels: int, global_percentile: float = 100.0, 
@@ -30,6 +31,7 @@ def apply_log2_quantization(model: nn.Module, num_levels: int, global_percentile
         New model with log2 quantized weights
     """
     model_q = deepcopy(model)
+    original_device = next(model_q.parameters()).device  # Store original device
     
     # Collect all weight parameters for global percentile computation
     all_weights = []
@@ -63,7 +65,9 @@ def apply_log2_quantization(model: nn.Module, num_levels: int, global_percentile
         unique_values = np.unique(all_quantized)
         print(f"  Unique quantized values: {len(unique_values)} values")
         print(f"  Sample values: {unique_values[:10]}")
-            
+    
+    # Move model back to original device
+    model_q = model_q.to(original_device)        
     return model_q
 
 
@@ -82,6 +86,7 @@ def apply_linear_quantization(model: nn.Module, weight_bits: int, global_percent
         New model with linear quantized weights
     """
     model_q = deepcopy(model)
+    original_device = next(model_q.parameters()).device  # Store original device
     
     # Collect original weight stats
     all_weights = []
@@ -94,11 +99,11 @@ def apply_linear_quantization(model: nn.Module, weight_bits: int, global_percent
         print(f"[LINEAR QUANTIZATION DEBUG] normalize_to_unit={normalize_to_unit}")
         print(f"  Original weights: min={all_weights_orig.min():.6f}, max={all_weights_orig.max():.6f}")
     
-    # Use the existing quantization framework - it modifies the model in place
+    # Use global quantization scheme for hardware-consistent evaluation (matches QAT)
     quantized_model = quantize_model_weights(
         model_q, 
         bits=weight_bits,
-        scheme="global",
+        scheme="global",  # Use global scheme to match QAT global scale approach
         symmetric=True,
         global_percentile=global_percentile,
         normalize_to_unit=normalize_to_unit
@@ -117,7 +122,86 @@ def apply_linear_quantization(model: nn.Module, weight_bits: int, global_percent
         print(f"  Unique quantized values: {len(unique_values)} values")
         print(f"  Sample values: {unique_values[:10]}")
     
+    # Move model back to original device
+    quantized_model = quantized_model.to(original_device)
     return quantized_model
+
+
+def evaluate_model_consistent(model: nn.Module, loader: DataLoader, device: torch.device, 
+                             apply_constraints: bool = True, verbose: bool = False) -> Dict[str, float]:
+    """
+    Consistent model evaluation with same protocol as QAT training.
+    
+    Args:
+        model: Model to evaluate
+        loader: DataLoader for evaluation
+        device: Device to run evaluation on
+        apply_constraints: Whether to apply hardware constraints (activation clipping, input scaling)
+        verbose: Whether to show progress bar
+        
+    Returns:
+        Dictionary with accuracy, precision, recall, f1 metrics
+    """
+    model.eval()
+    
+    # Apply activation constraint hooks if requested
+    hooks = []
+    if apply_constraints:
+        def activation_constraint_hook(module, input, output):
+            return torch.clamp(output, 0.0, 1024.0)
+        
+        # Apply hooks to modules with 'act' in name (matches controlled test)
+        for name, module in model.named_modules():
+            if 'act' in name:  # Apply to activation modules by name
+                hooks.append(module.register_forward_hook(activation_constraint_hook))
+    
+    total_correct = 0
+    total_samples = 0
+    all_preds = []
+    all_targets = []
+    
+    iterator = tqdm(loader, desc="Evaluating") if verbose else loader
+    
+    with torch.no_grad():
+        for batch_x, batch_y in iterator:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
+            
+            # Apply input scaling for hardware constraints if requested
+            if apply_constraints:
+                batch_min = batch_x.min()
+                batch_max = batch_x.max()
+                if batch_max > batch_min:
+                    batch_x = (batch_x - batch_min) / (batch_x.max() - batch_x.min()) * 1024.0
+            
+            outputs = model(batch_x)
+            preds = torch.argmax(outputs, dim=1)
+            
+            total_correct += (preds == batch_y).sum().item()
+            total_samples += batch_y.size(0)
+            
+            all_preds.extend(preds.cpu().numpy())
+            all_targets.extend(batch_y.cpu().numpy())
+    
+    # Clean up hooks
+    for hook in hooks:
+        hook.remove()
+    
+    # Compute metrics
+    accuracy = total_correct / total_samples
+    
+    # Compute macro-averaged precision, recall, F1
+    from sklearn.metrics import precision_score, recall_score, f1_score
+    precision = precision_score(all_targets, all_preds, average='macro', zero_division=0)
+    recall = recall_score(all_targets, all_preds, average='macro', zero_division=0)
+    f1 = f1_score(all_targets, all_preds, average='macro', zero_division=0)
+    
+    return {
+        'accuracy': accuracy,
+        'precision': precision, 
+        'recall': recall,
+        'f1': f1
+    }
 
 
 def create_subset_loader(dataloader: DataLoader, subset_size: int) -> DataLoader:
@@ -218,12 +302,16 @@ def main() -> None:
     temp_dir = tempfile.mkdtemp()
     
     try:
-        # Initialize original model using inference wrapper
+        # Load model directly for consistent evaluation
         print("\n=== Evaluating Original (Float) Model ===")
-        original_model = KeywordModel(args.config, args.weights, device)
+        from model.model import DilatedTCN
+        original_model = DilatedTCN.from_config(cfg)
+        checkpoint = torch.load(args.weights, map_location='cpu')
+        original_model.load_state_dict(checkpoint, strict=False)
+        original_model = original_model.to(device).eval()
         
-        # Evaluate original model
-        original_metrics = original_model.evaluate_dataloader(eval_loader, device, verbose=args.verbose)
+        # Evaluate original model with consistent protocol
+        original_metrics = evaluate_model_consistent(original_model, eval_loader, device, verbose=args.verbose)
         print(f"Original: Acc={original_metrics['accuracy']:.4f} "
               f"P={original_metrics['precision']:.4f} R={original_metrics['recall']:.4f} "
               f"F1={original_metrics['f1']:.4f}")
@@ -247,21 +335,16 @@ def main() -> None:
                 
                 # Apply linear quantization to original model
                 model_linear = apply_linear_quantization(
-                    original_model.model, 
+                    original_model, 
                     weight_bits=bits,
                     global_percentile=args.global_percentile,
                     normalize_to_unit=args.normalize_to_unit
                 )
+                model_linear = model_linear.to(device)  # Ensure model is on correct device
                 
-                # Save quantized weights temporarily
-                temp_weights = os.path.join(temp_dir, f"linear_{bits}bit.pt")
-                torch.save(model_linear.state_dict(), temp_weights)
-                
-                # Create new inference model with quantized weights
-                linear_model = KeywordModel(args.config, temp_weights, device)
-                
-                # Evaluate quantized model
-                linear_metrics = linear_model.evaluate_dataloader(eval_loader, device, verbose=args.verbose)
+                # Evaluate quantized model with same protocol as QAT
+                linear_metrics = evaluate_model_consistent(model_linear, eval_loader, device, 
+                                                          apply_constraints=True, verbose=args.verbose)
                 results.append(("linear", f"{bits}bit", linear_metrics))
                 
                 print(f"Linear {bits}-bit: Acc={linear_metrics['accuracy']:.4f} "
@@ -280,21 +363,16 @@ def main() -> None:
                 
                 # Apply log2 quantization to original model
                 model_log2 = apply_log2_quantization(
-                    original_model.model,
+                    original_model,
                     num_levels=levels,
                     global_percentile=args.global_percentile,
                     normalize_to_unit=args.normalize_to_unit
                 )
+                model_log2 = model_log2.to(device)  # Ensure model is on correct device
                 
-                # Save quantized weights temporarily
-                temp_weights = os.path.join(temp_dir, f"log2_{levels}lvl.pt")
-                torch.save(model_log2.state_dict(), temp_weights)
-                
-                # Create new inference model with quantized weights
-                log2_model = KeywordModel(args.config, temp_weights, device)
-                
-                # Evaluate quantized model
-                log2_metrics = log2_model.evaluate_dataloader(eval_loader, device, verbose=args.verbose)
+                # Evaluate quantized model with same protocol as QAT
+                log2_metrics = evaluate_model_consistent(model_log2, eval_loader, device, 
+                                                        apply_constraints=True, verbose=args.verbose)
                 results.append(("log2", f"{levels}lvl", log2_metrics))
                 
                 print(f"Log2 {levels}-level: Acc={log2_metrics['accuracy']:.4f} "
