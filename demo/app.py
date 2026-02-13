@@ -16,7 +16,7 @@ matplotlib.use('TkAgg')
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 
-from inference import KeywordModel
+from inference.model import KeywordModel
 
 # ---------------------------
 # Audio + feature processing

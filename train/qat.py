@@ -1,3 +1,11 @@
+"""
+Simplified QAT for hardware constraints:
+- Weights: [-1, +1] range with n-bit linear or log2 quantization
+- Activations: [0, act_max] range with linear quantization only  
+- No batch normalization support (assumes norm: none)
+- Weight clipping integrated
+"""
+
 import os
 import argparse
 import torch
@@ -7,13 +15,11 @@ import torch.nn.functional as F
 from tqdm import tqdm
 from time import time
 import numpy as np
-from typing import Optional, Tuple, List, Dict, Any, Union
+from typing import Optional, Tuple, Dict, Any
 from torch.utils.data import DataLoader
 
 from train.utils import (
-    _binary_counts, _derive_metrics,
-    _multiclass_confusion_add, _multiclass_macro_prf1, export_quantized_weights_npz,
-    load_state_dict_forgiving, fold_batchnorm,
+    _binary_counts, _derive_metrics, _multiclass_confusion_add, _multiclass_macro_prf1,
 )
 from config import load_config
 from model.model import DilatedTCN
@@ -21,334 +27,184 @@ from data_loader.utils import make_datasets, get_num_classes
 from analysis.plot_metrics import plot_metrics, plot_test_confusion_matrix
 
 
-class CustomFakeQuantize(nn.Module):
-    def __init__(
-        self,
-        bits: int = 8,
-        symmetric: bool = True,
-        ema: bool = True,
-        momentum: float = 0.95,
-        eps: float = 1e-8,
-        per_channel: bool = False,
-        ch_axis: int = 0,
-        use_external: bool = False,
-        external_scale: Optional[Union[float, torch.Tensor]] = None,
-        external_zero_point: Optional[Union[float, torch.Tensor]] = None,
-    ) -> None:
+def create_qat_dataloaders(cfg, batch_size, num_workers=2, pin_memory=True, persistent_workers=True, prefetch_factor=2):
+    """Create dataloaders with QAT-specific performance settings"""
+    # Update cfg with dataloader settings for make_datasets
+    original_batch_size = cfg.get("train", {}).get("batch_size")
+    original_num_workers = cfg.get("train", {}).get("num_workers")
+    original_pin_memory = cfg.get("train", {}).get("pin_memory")
+    original_persistent_workers = cfg.get("train", {}).get("persistent_workers") 
+    original_prefetch_factor = cfg.get("train", {}).get("prefetch_factor")
+    
+    # Temporarily override with QAT settings
+    cfg.setdefault("train", {})
+    cfg["train"]["batch_size"] = batch_size
+    cfg["train"]["num_workers"] = num_workers
+    cfg["train"]["pin_memory"] = pin_memory
+    cfg["train"]["persistent_workers"] = persistent_workers
+    cfg["train"]["prefetch_factor"] = prefetch_factor
+    
+    try:
+        train_loader, val_loader, test_loader = make_datasets(cfg, which="all", batch_size=batch_size)
+        return train_loader, val_loader, test_loader
+    finally:
+        # Restore original settings
+        if original_batch_size is not None:
+            cfg["train"]["batch_size"] = original_batch_size
+        if original_num_workers is not None:
+            cfg["train"]["num_workers"] = original_num_workers
+        if original_pin_memory is not None:
+            cfg["train"]["pin_memory"] = original_pin_memory
+        if original_persistent_workers is not None:
+            cfg["train"]["persistent_workers"] = original_persistent_workers
+        if original_prefetch_factor is not None:
+            cfg["train"]["prefetch_factor"] = original_prefetch_factor
+
+
+class HardwareConstrainedQuantizer(nn.Module):
+    """Simple quantizer for hardware constraints"""
+    
+    def __init__(self, method: str = "linear", bits: int = 8, 
+                 activation_max: float = 1024.0, log2_levels: int = 4,
+                 weight_min: float = -1.0, weight_max: float = 1.0):
         super().__init__()
+        self.method = method
         self.bits = bits
-        self.symmetric = symmetric
-        self.ema = ema
-        self.momentum = momentum
-        self.eps = eps
-        self.per_channel = per_channel
-        self.ch_axis = ch_axis
+        self.activation_max = activation_max
+        self.log2_levels = log2_levels
+        self.weight_min = weight_min
+        self.weight_max = weight_max
         self.enabled = True
-        self.frozen = False  # when True, stop updating observer
-        # Global fixed scale mode
-        self.use_external = bool(use_external)
-        # Buffers
-        self.register_buffer("scale", torch.tensor(1.0))
-        self.register_buffer("running_max", torch.tensor(1.0))
-        self.register_buffer("running_min", torch.tensor(0.0))  # for asymmetric if needed
-        # External constants (registered so they move with .to(device))
-        if external_scale is not None:
-            self.register_buffer("external_scale", torch.as_tensor(external_scale, dtype=torch.float32))
-        else:
-            self.external_scale = None
-        if external_zero_point is not None:
-            self.register_buffer("external_zero_point", torch.as_tensor(external_zero_point, dtype=torch.float32))
-        else:
-            self.external_zero_point = None
-        if self.use_external:
-            # In external mode, never update observers
-            self.frozen = True
-
-    def _qrange(self) -> Tuple[int, int]:
-        if self.symmetric:
-            qmax = (1 << (self.bits - 1)) - 1
-            qmin = -qmax
-        else:
-            qmin = 0
-            qmax = (1 << self.bits) - 1
-        return qmin, qmax
-
-    def _observe(self, x: torch.Tensor) -> None:
-        if self.frozen:
-            return
-        if self.per_channel:
-            # reduce over all dims except ch_axis
-            reduce_dims = [d for d in range(x.dim()) if d != self.ch_axis]
-            if self.symmetric:
-                max_abs = x.detach().abs().amax(dim=reduce_dims)
-                if self.ema:
-                    self.running_max = torch.maximum(
-                        self.running_max * self.momentum + max_abs * (1 - self.momentum),
-                        torch.full_like(max_abs, self.eps),
-                    )
+        
+        # For linear quantization
+        if method == "linear":
+            self.weight_qmax = (1 << (bits - 1)) - 1  # e.g., 7 for 4-bit
+            self.weight_qmin = -self.weight_qmax
+            self.weight_scale = self.weight_max / self.weight_qmax  # scale for weight range
+        
+        # For log2 quantization  
+        elif method == "log2":
+            # Create power-of-2 levels: ±1, ±2, ±4, ±8, etc.
+            self.pos_levels = [2**i for i in range(log2_levels)]  # [1, 2, 4, 8]
+            self.neg_levels = [-x for x in reversed(self.pos_levels)]  # [-8, -4, -2, -1]
+            self.levels = self.neg_levels + [0] + self.pos_levels
+            self.register_buffer("level_tensor", torch.tensor(self.levels, dtype=torch.float32))
+    
+    def quantize_weights(self, weights: torch.Tensor) -> torch.Tensor:
+        """Quantize weights to hardware constraints"""
+        if not self.enabled:
+            return weights
+            
+        # First ensure weights are in [weight_min, weight_max] range (should be from clipping)
+        w_clipped = torch.clamp(weights, self.weight_min, self.weight_max)
+        
+        if self.method == "linear":
+            # Standard linear quantization in [-1, +1] range
+            q_codes = torch.round(w_clipped / self.weight_scale)
+            q_codes = torch.clamp(q_codes, self.weight_qmin, self.weight_qmax)
+            w_quantized = q_codes * self.weight_scale
+            
+        elif self.method == "log2":
+            # Log2 quantization to power-of-2 levels
+            w_quantized = torch.zeros_like(w_clipped)
+            for i, val in enumerate(w_clipped.view(-1)):
+                if torch.abs(val) < 1e-8:
+                    w_quantized.view(-1)[i] = 0.0
                 else:
-                    self.running_max = torch.clamp(max_abs, min=self.eps)
-            else:
-                x_max = x.detach().amax(dim=reduce_dims)
-                x_min = x.detach().amin(dim=reduce_dims)
-                if self.ema:
-                    self.running_max = self.running_max * self.momentum + x_max * (1 - self.momentum)
-                    self.running_min = self.running_min * self.momentum + x_min * (1 - self.momentum)
-                else:
-                    self.running_max = x_max
-                    self.running_min = x_min
+                    # Find closest log2 level
+                    distances = torch.abs(self.level_tensor - val)
+                    closest_idx = torch.argmin(distances)
+                    w_quantized.view(-1)[i] = self.level_tensor[closest_idx]
+            
+            # Normalize to [weight_min, weight_max] range for hardware
+            max_level = max(self.pos_levels)
+            w_quantized = w_quantized / max_level * self.weight_max
+        
         else:
-            if self.symmetric:
-                max_abs = x.detach().abs().max()
-                if self.ema:
-                    self.running_max = torch.maximum(
-                        self.running_max * self.momentum + max_abs * (1 - self.momentum),
-                        torch.tensor(self.eps, device=x.device),
-                    )
-                else:
-                    self.running_max = torch.clamp(max_abs, min=self.eps)
-            else:
-                x_max = x.detach().max()
-                x_min = x.detach().min()
-                if self.ema:
-                    self.running_max = self.running_max * self.momentum + x_max * (1 - self.momentum)
-                    self.running_min = self.running_min * self.momentum + x_min * (1 - self.momentum)
-                else:
-                    self.running_max = x_max
-                    self.running_min = x_min
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if (not self.enabled) or self.bits >= 32:
-            return x
-
-        # If using a global, fixed scale, bypass observers and use provided constants
-        if self.use_external and (self.external_scale is not None):
-            qmin, qmax = self._qrange()
-            s = torch.clamp(self.external_scale, min=self.eps)
-            self.scale = s.detach()
-            if self.symmetric:
-                q = torch.round(x / s).clamp(qmin, qmax)
-                x_hat = q * s
-            else:
-                z = self.external_zero_point if (self.external_zero_point is not None) else torch.tensor(0.0, device=x.device)
-                q = torch.round(x / s + z).clamp(qmin, qmax)
-                x_hat = (q - z) * s
-            return x + (x_hat - x).detach()
-
-        # Normal (learn/observe) mode
-        self._observe(x)
-        qmin, qmax = self._qrange()
-        if self.symmetric:
-            max_val = self.running_max
-            scale = max_val / qmax
-            scale = torch.where(scale == 0, torch.full_like(scale, self.eps), scale)
-            self.scale = scale.detach()
-            if self.per_channel:
-                # reshape scale for broadcast on ch_axis
-                shape = [1] * x.dim()
-                shape[self.ch_axis] = -1
-                s = self.scale.view(shape)
-            else:
-                s = self.scale
-            q = torch.round(x / s).clamp(qmin, qmax)
-            x_hat = q * s
-        else:
-            # Proper asymmetric: use min/max and zero_point
-            rng = self.running_max - self.running_min
-            if self.per_channel:
-                rng = torch.where(rng <= self.eps, torch.full_like(rng, self.eps), rng)
-            else:
-                rng = torch.clamp(rng, min=self.eps)
-            scale = rng / qmax
-            self.scale = scale.detach()
-            if self.per_channel:
-                # reshape scale for broadcast on ch_axis
-                shape = [1] * x.dim()
-                shape[self.ch_axis] = -1
-                s = self.scale.view(shape)
-                z = torch.round((-self.running_min / self.scale)).view(shape)
-            else:
-                s = self.scale
-                z = torch.round(-self.running_min / self.scale)
-            q = torch.round(x / s + z).clamp(qmin, qmax)
-            x_hat = (q - z) * s
-        return x + (x_hat - x).detach()
+            raise ValueError(f"Unknown quantization method: {self.method}")
+        
+        # Straight-through estimator
+        return weights + (w_quantized - weights).detach()
+    
+    def quantize_activations(self, activations: torch.Tensor) -> torch.Tensor:
+        """Quantize activations to [0, activation_max] range"""
+        if not self.enabled:
+            return activations
+        
+        # Ensure activations are non-negative and within bounds
+        a_clipped = torch.clamp(activations, 0.0, self.activation_max)
+        
+        # Linear quantization for activations (always)
+        act_qmax = (1 << self.bits) - 1  # unsigned range [0, 2^n-1]
+        act_scale = self.activation_max / act_qmax
+        
+        q_codes = torch.round(a_clipped / act_scale)
+        q_codes = torch.clamp(q_codes, 0, act_qmax)
+        a_quantized = q_codes * act_scale
+        
+        # Straight-through estimator 
+        return activations + (a_quantized - activations).detach()
 
 
-def apply_custom_fake_quant(
-    model: nn.Module,
-    weight_bits: int,
-    act_bits: int,
-    weight_symmetric: bool = True,
-    act_symmetric: bool = True,
-    weight_use_global: bool = False,
-    weight_global_scale: Optional[float] = None,
-    act_use_global: bool = False,
-    act_global_scale: Optional[float] = None,
-    act_global_zero_point: float = 0.0,
-) -> nn.Module:
-    # Per-channel weights unless global fixed is requested
-    for m in model.modules():
-        if isinstance(m, nn.Conv1d):
-            m.weight_fake = CustomFakeQuantize(
-                bits=weight_bits,
-                symmetric=weight_symmetric,
-                per_channel=(not weight_use_global),
-                ch_axis=0,
-                use_external=weight_use_global,
-                external_scale=weight_global_scale,
-                external_zero_point=0.0 if weight_symmetric else 0.0  # weight zp typically 0 even in asym hw
-            )
-            orig = m.forward
-            def conv_fwd(self: nn.Conv1d, inp: torch.Tensor) -> torch.Tensor:
-                w_q = self.weight_fake(self.weight)
-                return F.conv1d(inp, w_q, self.bias, self.stride, self.padding, self.dilation, self.groups)
-            m.forward = conv_fwd.__get__(m, m.__class__)
-        elif isinstance(m, nn.Linear):
-            m.weight_fake = CustomFakeQuantize(
-                bits=weight_bits,
-                symmetric=weight_symmetric,
-                per_channel=(not weight_use_global),
-                ch_axis=0,
-                use_external=weight_use_global,
-                external_scale=weight_global_scale,
-                external_zero_point=0.0 if weight_symmetric else 0.0
-            )
-            def lin_fwd(self: nn.Linear, inp: torch.Tensor) -> torch.Tensor:
-                w_q = self.weight_fake(self.weight)
-                return F.linear(inp, w_q, self.bias)
-            m.forward = lin_fwd.__get__(m, m.__class__)
-    # Per-layer input/output activation fake quant (global if requested)
-    if act_bits < 32:
-        for m in model.modules():
-            if isinstance(m, (nn.Conv1d, nn.Linear)):
-                m.input_fake = CustomFakeQuantize(
-                    bits=act_bits,
-                    symmetric=act_symmetric,
-                    per_channel=False,
-                    use_external=act_use_global,
-                    external_scale=act_global_scale,
-                    external_zero_point=act_global_zero_point if not act_symmetric else 0.0
-                )
-                orig = m.forward
-                def wrapped(self: Union[nn.Conv1d, nn.Linear], x: torch.Tensor, _orig=orig) -> torch.Tensor:
-                    x = self.input_fake(x)
-                    return _orig(x)
-                m.forward = wrapped.__get__(m, m.__class__)
-
-    # Residual add alignment: quantize block outputs (after out + skip)
-    if act_bits < 32:
-        for m in model.modules():
-            if m.__class__.__name__ in ("TemporalBlock", "ResidualBlock", "TCNBlock"):
-                m.output_fake = CustomFakeQuantize(
-                    bits=act_bits,
-                    symmetric=act_symmetric,
-                    per_channel=False,
-                    use_external=act_use_global,
-                    external_scale=act_global_scale,
-                    external_zero_point=act_global_zero_point if not act_symmetric else 0.0
-                )
-                _orig = m.forward
-                def _wrap(self, *args: Any, __orig=_orig, **kwargs: Any) -> torch.Tensor:
-                    out = __orig(*args, **kwargs)
-                    return self.output_fake(out)
-                m.forward = _wrap.__get__(m, m.__class__)
+def apply_hardware_qat(model: nn.Module, quantizer: HardwareConstrainedQuantizer) -> nn.Module:
+    """Apply quantization to model weights and activations"""
+    
+    # TODO: Add input feature quantization later - temporarily disabled for debugging
+    # Add weight quantization to Conv1d and Linear layers
+    for name, module in model.named_modules():
+        if isinstance(module, (nn.Conv1d, nn.Linear)):
+            # Store original forward method
+            original_forward = module.forward
+            
+            def create_quantized_forward(orig_forward, quant):
+                def quantized_forward(self, x):
+                    # Quantize weights
+                    if hasattr(self, 'weight'):
+                        w_quantized = quant.quantize_weights(self.weight)
+                        # Use quantized weight directly without replacing self.weight
+                        if isinstance(self, nn.Conv1d):
+                            result = F.conv1d(x, w_quantized, self.bias, 
+                                            self.stride, self.padding, self.dilation, self.groups)
+                        else:  # Linear
+                            result = F.linear(x, w_quantized, self.bias)
+                        return result
+                    else:
+                        return orig_forward(x)
+                return quantized_forward
+            
+            # Replace forward method
+            module.forward = create_quantized_forward(original_forward, quantizer).__get__(module, type(module))
+    
+    # Add activation quantization after ReLU layers
+    for name, module in model.named_modules():
+        if isinstance(module, nn.ReLU):
+            original_forward = module.forward
+            
+            def create_quantized_relu(orig_forward, quant):
+                def quantized_relu_forward(self, x):
+                    x = orig_forward(x)  # Apply ReLU first
+                    # Scale to [0, act_max], quantize, then scale back
+                    x_scaled = x * quant.activation_max
+                    x_quantized = quant.quantize_activations(x_scaled) 
+                    return x_quantized / quant.activation_max
+                return quantized_relu_forward
+            
+            module.forward = create_quantized_relu(original_forward, quantizer).__get__(module, type(module))
+    
     return model
 
 
-def set_qat_mode(model: nn.Module, enabled: bool = True, freeze: bool = False) -> None:
-    for m in model.modules():
-        if hasattr(m, "enabled"):
-            m.enabled = enabled
-        if hasattr(m, "frozen"):
-            m.frozen = freeze
-
-
-def evaluate(
-    model: nn.Module,
-    loader: DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    task_type: str,
-    num_classes: int,
-    threshold: float = 0.5,
-) -> Tuple[float, float, float, float, float]:
-    model.eval()
-    total_loss, correct, total, tp, fp, fn = 0.0, 0, 0, 0, 0, 0
-    cm = [[0] * num_classes for _ in range(num_classes)] if task_type == "multiclass" else None
+def clip_model_weights(model: nn.Module, weight_min: float = -1.0, weight_max: float = 1.0) -> None:
+    """Clip all model weights to hardware constraints"""
     with torch.no_grad():
-        for batch in loader:
-            if isinstance(batch, (list, tuple)):
-                x, y = batch[0], batch[1]
-            elif isinstance(batch, dict):
-                x, y = batch["x"], batch["y"]
-            else:
-                raise RuntimeError("Unexpected batch format")
-            x = x.to(device)
-            targets = y.float().unsqueeze(1).to(device) if task_type == "binary" else y.long().to(device)
-            logits = model(x)
-            loss = criterion(logits, targets)
-            total_loss += loss.item()
-            if task_type == "binary":
-                probs = torch.sigmoid(logits)
-                preds = (probs > threshold).long()
-                correct += (preds == targets.long()).sum().item()
-                total += targets.numel()
-                _tp, _fp, _fn, _, _ = _binary_counts(preds, targets)
-                tp += _tp; fp += _fp; fn += _fn
-            else:
-                preds = torch.argmax(logits, dim=1)
-                correct += (preds == targets).sum().item()
-                total += targets.numel()
-                cm = _multiclass_confusion_add(cm, preds, targets, num_classes)
-    if task_type == "binary":
-        avg_loss, acc, prec, rec, f1 = _derive_metrics(total_loss, len(loader), correct, total, tp, fp, fn)
-    else:
-        avg_loss, acc = _derive_metrics(total_loss, len(loader), correct, total)
-        prec, rec, f1 = _multiclass_macro_prf1(cm)
-    return avg_loss, acc, prec, rec, f1
+        for name, param in model.named_parameters():
+            if 'weight' in name and param.dim() > 1:
+                param.clamp_(weight_min, weight_max)
 
 
-def _preview_scale(t: torch.Tensor, k: int = 3) -> Union[List[float], str]:
-    # Return a compact preview of a scale tensor
-    try:
-        arr = t.detach().flatten().cpu().numpy()
-        return np.round(arr[:k], 6).tolist()
-    except Exception:
-        return str(t)
-
-def print_qat_scales(model: nn.Module, limit: int = 3, prefix: str = "") -> None:
-    """
-    Print a few fake-quant scales for weights and activations to verify freezing.
-    Shows first `limit` modules that have any of: weight_fake, input_fake, output_fake.
-    """
-    printed = 0
-    for name, m in model.named_modules():
-        has_any = any(hasattr(m, attr) for attr in ("weight_fake", "input_fake", "output_fake"))
-        if not has_any:
-            continue
-
-        parts = []
-        flags = []
-        if hasattr(m, "weight_fake") and isinstance(m.weight_fake, CustomFakeQuantize):
-            parts.append(f"w_scale={_preview_scale(m.weight_fake.scale)}")
-            flags.append(f"w(enabled={m.weight_fake.enabled}, frozen={m.weight_fake.frozen})")
-        if hasattr(m, "input_fake") and isinstance(m.input_fake, CustomFakeQuantize):
-            parts.append(f"a_in_scale={_preview_scale(m.input_fake.scale)}")
-            flags.append(f"a_in(enabled={m.input_fake.enabled}, frozen={m.input_fake.frozen})")
-        if hasattr(m, "output_fake") and isinstance(m.output_fake, CustomFakeQuantize):
-            parts.append(f"a_out_scale={_preview_scale(m.output_fake.scale)}")
-            flags.append(f"a_out(enabled={m.output_fake.enabled}, frozen={m.output_fake.frozen})")
-
-        if parts:
-            mod_name = name if name else m.__class__.__name__
-            print(f"{prefix} [{mod_name}] " + " | ".join(parts) + " | " + ", ".join(flags))
-            printed += 1
-            if printed >= limit:
-                break
-
-def train_qat(
+def train_qat_simple(
     model: nn.Module,
+    quantizer: HardwareConstrainedQuantizer,
     train_loader: DataLoader,
     val_loader: DataLoader,
     optimizer: optim.Optimizer,
@@ -357,62 +213,46 @@ def train_qat(
     epochs: int,
     task_type: str,
     num_classes: int,
-    threshold: float = 0.5,
-    warmup_epochs: int = 1,
-    wb: Optional[int] = None,
-    ab: Optional[int] = None,
-    weight_use_global: bool = False,
-    act_use_global: bool = False,
-    weight_symmetric: bool = True,
-    act_symmetric: bool = True,
-) -> Tuple[Dict[str, List[float]], Dict[str, List[float]]]:
-    # init histories
-    hist = {"loss": [], "acc": [], "prec": [], "rec": [], "f1": []}
+    weight_clipping: bool = True,
+    weight_min: float = -1.0,
+    weight_max: float = 1.0,
+) -> Tuple[Dict[str, list], Dict[str, list]]:
+    """Simple QAT training loop"""
+    
+    train_hist = {"loss": [], "acc": [], "prec": [], "rec": [], "f1": []}
     val_hist = {"loss": [], "acc": [], "prec": [], "rec": [], "f1": []}
-
-    for epoch in range(1, epochs+1):
+    
+    for epoch in range(1, epochs + 1):
+        # Training phase
         model.train()
-
-        # Switch to global fixed scales right after warmup is done
-        if epoch == warmup_epochs + 1:
-            # Derive global scales from warmup stats/data and apply
-            if weight_use_global and wb is not None:
-                gw_s, gw_zp = _compute_global_weight_scale(model, bits=wb, symmetric=weight_symmetric)
-                _apply_global_weight_scale(model, gw_s, zero_point=(0.0 if weight_symmetric else gw_zp))
-                print(f"[QAT] Applied GLOBAL weight scale from warmup: scale={gw_s:.6g}, zp={(0.0 if weight_symmetric else gw_zp):.3f}")
-            if act_use_global and ab is not None and ab < 32:
-                ga_s, ga_zp = _compute_global_activation_scale(model, bits=ab, symmetric=act_symmetric)
-                _apply_global_activation_scale(model, ga_s, zero_point=(0.0 if act_symmetric else ga_zp))
-                print(f"[QAT] Applied GLOBAL activation scale from warmup: scale={ga_s:.6g}, zp={(0.0 if act_symmetric else ga_zp):.3f}")
-
-            # Freeze observers thereafter
-            set_qat_mode(model, enabled=True, freeze=True)
-            print_qat_scales(model, limit=3, prefix=f"[After freeze @epoch {epoch}]")
-
-        total_loss, correct, total, tp, fp, fn = 0.0, 0, 0, 0, 0, 0
+        total_loss, correct, total = 0.0, 0, 0
+        tp = fp = fn = 0
         cm = [[0] * num_classes for _ in range(num_classes)] if task_type == "multiclass" else None
-
-        loop = tqdm(train_loader, desc=f"Epoch {epoch}", leave=False)
-        for batch in loop:
-            if isinstance(batch, (list, tuple)):
-                x, y = batch[0], batch[1]
-            elif isinstance(batch, dict):
-                x, y = batch["x"], batch["y"]
+        
+        loop = tqdm(train_loader, desc=f"QAT Epoch {epoch}", leave=False)
+        for batch_x, batch_y in loop:
+            batch_x = batch_x.to(device)
+            if task_type == "binary":
+                targets = batch_y.float().unsqueeze(1).to(device)
             else:
-                raise RuntimeError("Unexpected batch format")
-            x = x.to(device)
-            targets = y.float().unsqueeze(1).to(device) if task_type == "binary" else y.long().to(device)
-
+                targets = batch_y.long().to(device)
+            
             optimizer.zero_grad()
-            logits = model(x)
+            logits = model(batch_x)
             loss = criterion(logits, targets)
             loss.backward()
             optimizer.step()
-
+            
+            # Apply weight clipping after optimizer step
+            if weight_clipping:
+                clip_model_weights(model, weight_min, weight_max)
+            
             total_loss += loss.item()
+            
+            # Compute metrics
             if task_type == "binary":
                 probs = torch.sigmoid(logits)
-                preds = (probs > threshold).long()
+                preds = (probs > 0.5).long()
                 correct += (preds == targets.long()).sum().item()
                 total += targets.numel()
                 _tp, _fp, _fn, _, _ = _binary_counts(preds, targets)
@@ -422,371 +262,235 @@ def train_qat(
                 correct += (preds == targets).sum().item()
                 total += targets.numel()
                 cm = _multiclass_confusion_add(cm, preds, targets, num_classes)
-
+        
+        # Training metrics
         if task_type == "binary":
             avg_loss, acc, prec, rec, f1 = _derive_metrics(total_loss, len(train_loader), correct, total, tp, fp, fn)
         else:
             avg_loss, acc = _derive_metrics(total_loss, len(train_loader), correct, total)
             prec, rec, f1 = _multiclass_macro_prf1(cm)
-
-        hist["loss"].append(avg_loss); hist["acc"].append(acc)
-        hist["prec"].append(prec); hist["rec"].append(rec); hist["f1"].append(f1)
-
-        val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate(model, val_loader, criterion, device, task_type, num_classes, threshold)
+        
+        train_hist["loss"].append(avg_loss); train_hist["acc"].append(acc)
+        train_hist["prec"].append(prec); train_hist["rec"].append(rec); train_hist["f1"].append(f1)
+        
+        # Validation phase  
+        val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate_qat_simple(
+            model, val_loader, criterion, device, task_type, num_classes
+        )
         val_hist["loss"].append(val_loss); val_hist["acc"].append(val_acc)
         val_hist["prec"].append(val_prec); val_hist["rec"].append(val_rec); val_hist["f1"].append(val_f1)
-
-        print(f"[Epoch {epoch}] Train Loss: {avg_loss:.4f}  Acc: {acc:.4f}  P: {prec:.4f}  R: {rec:.4f}  F1: {f1:.4f} | "
-              f"Val Loss: {val_loss:.4f}  Acc: {val_acc:.4f}  P: {val_prec:.4f}  R: {val_rec:.4f}  F1: {val_f1:.4f}")
-
-        # Print a small snapshot of scales on a few epochs to observe stability
-        if epoch in (1, warmup_epochs + 1, epochs):
-            print_qat_scales(model, limit=3, prefix=f"[Scales @epoch {epoch}]")
-
-    return hist, val_hist
-
-
-@torch.no_grad()
-def export_quant_npz_from_model(
-    model: nn.Module,
-    out_npz_path: str,
-    bits: int = 5,
-    per_channel: bool = True,
-    symmetric_weights: bool = True,
-    use_global: bool = False,
-    global_scale: Optional[float] = None,
-    global_zero_point: float = 0.0,
-) -> None:
-    # If caller requested global but didn't pass a value, try to read it from the model
-    if use_global and (global_scale is None):
-        for m in model.modules():
-            if hasattr(m, "weight_fake") and isinstance(m.weight_fake, CustomFakeQuantize):
-                fq = m.weight_fake
-                if getattr(fq, "use_external", False) and (getattr(fq, "external_scale", None) is not None):
-                    global_scale = float(fq.external_scale.item())
-                    if not symmetric_weights and (getattr(fq, "external_zero_point", None) is not None):
-                        global_zero_point = float(fq.external_zero_point.item())
-                    break
-        if global_scale is None:
-            raise ValueError("use_global=True but no global scale found on model; ensure scales were applied after warmup.")
+        
+        print(f"[Epoch {epoch}] Train: Loss={avg_loss:.4f} Acc={acc:.4f} F1={f1:.4f} | "
+              f"Val: Loss={val_loss:.4f} Acc={val_acc:.4f} F1={val_f1:.4f}")
+        
+        # Print weight range verification
+        weight_mins, weight_maxs = [], []
+        for name, param in model.named_parameters():
+            if 'weight' in name and param.dim() > 1:
+                weight_mins.append(param.min().item())
+                weight_maxs.append(param.max().item())
+        
+        if weight_mins and weight_maxs:
+            global_min, global_max = min(weight_mins), max(weight_maxs)
+            print(f"[Weights] Range: [{global_min:.4f}, {global_max:.4f}] "
+                  f"({'✓' if global_min >= weight_min - 1e-6 and global_max <= weight_max + 1e-6 else '✗'})")
     
-    qmax = (1 << (bits - 1)) - 1 if symmetric_weights else (1 << bits) - 1
-    qmin = -qmax if symmetric_weights else 0
-    names, q_list, scale_list = [], [], []
-    for name, m in model.named_modules():
-        if isinstance(m, (nn.Conv1d, nn.Linear)) and hasattr(m, "weight"):
-            w = m.weight.detach().float().cpu()
-            if use_global and (global_scale is not None):
-                s = float(global_scale)
-                s = max(s, 1e-8)
-                if symmetric_weights:
-                    q = torch.round(w / s).clamp(qmin, qmax).to(torch.int16)
-                else:
-                    z = float(global_zero_point)
-                    q = torch.round(w / s + z).clamp(qmin, qmax).to(torch.int16)
-                names.append(f"{name}.weight" if name else "weight")
-                q_list.append(q.numpy())
-                scale_list.append(np.array(s, dtype=np.float32))
-            elif per_channel and w.dim() >= 2:
-                oc = w.shape[0]
-                w2 = w.view(oc, -1)
-                max_abs = w2.abs().max(dim=1).values if symmetric_weights else w2.max(dim=1).values
-                scale = torch.where(max_abs == 0, torch.ones_like(max_abs), max_abs / qmax)
-                q = torch.round(w2 / scale[:, None]).clamp(qmin, qmax).to(torch.int16)
-                names.append(f"{name}.weight" if name else "weight")
-                q_list.append(q.numpy())
-                scale_list.append(scale.numpy())
+    return train_hist, val_hist
+
+
+def evaluate_qat_simple(
+    model: nn.Module,
+    loader: DataLoader, 
+    criterion: nn.Module,
+    device: torch.device,
+    task_type: str,
+    num_classes: int,
+) -> Tuple[float, float, float, float, float]:
+    """Simple evaluation for QAT model"""
+    model.eval()
+    total_loss, correct, total = 0.0, 0, 0
+    tp = fp = fn = 0
+    cm = [[0] * num_classes for _ in range(num_classes)] if task_type == "multiclass" else None
+    
+    with torch.no_grad():
+        for batch_x, batch_y in loader:
+            batch_x = batch_x.to(device)
+            if task_type == "binary":
+                targets = batch_y.float().unsqueeze(1).to(device)
             else:
-                max_abs = w.abs().max() if symmetric_weights else w.max()
-                if max_abs == 0:
-                    continue
-                scale = (max_abs / qmax).item()
-                q = torch.round(w / scale).clamp(qmin, qmax).to(torch.int16)
-                names.append(f"{name}.weight" if name else "weight")
-                q_list.append(q.numpy())
-                scale_list.append(np.array(scale, dtype=np.float32))
-    os.makedirs(os.path.dirname(out_npz_path), exist_ok=True)
-    np.savez(
-        out_npz_path,
-        names=np.array(names, dtype=object),
-        q_list=np.array(q_list, dtype=object),
-        scale_list=np.array(scale_list, dtype=object),
-        bits=np.array(bits),
-        symmetric=np.array(symmetric_weights),
-        per_channel=np.array(per_channel and not use_global),
-    )
-    print(f"[OK] Exported {len(names)} tensors to {out_npz_path}")
-
-
-def _qmax_qmin(bits: int, symmetric: bool) -> Tuple[int, int]:
-    if symmetric:
-        qmax = (1 << (bits - 1)) - 1
-        qmin = -qmax
+                targets = batch_y.long().to(device)
+            
+            logits = model(batch_x)
+            loss = criterion(logits, targets)
+            total_loss += loss.item()
+            
+            if task_type == "binary":
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).long()
+                correct += (preds == targets.long()).sum().item()
+                total += targets.numel()
+                _tp, _fp, _fn, _, _ = _binary_counts(preds, targets)
+                tp += _tp; fp += _fp; fn += _fn
+            else:
+                preds = torch.argmax(logits, dim=1)
+                correct += (preds == targets).sum().item()
+                total += targets.numel()
+                cm = _multiclass_confusion_add(cm, preds, targets, num_classes)
+    
+    if task_type == "binary":
+        return _derive_metrics(total_loss, len(loader), correct, total, tp, fp, fn)
     else:
-        qmax = (1 << bits) - 1
-        qmin = 0
-    return qmin, qmax
-
-@torch.no_grad()
-def _compute_global_weight_scale(
-    model: nn.Module,
-    bits: int,
-    symmetric: bool = True,
-    eps: float = 1e-8,
-) -> Tuple[float, float]:
-    qmin, qmax = _qmax_qmin(bits, symmetric)
-    w_min = None
-    w_max = None
-    for m in model.modules():
-        if isinstance(m, (nn.Conv1d, nn.Linear)) and hasattr(m, "weight"):
-            w = m.weight.detach()
-            cur_min = w.min()
-            cur_max = w.max()
-            w_min = cur_min if w_min is None else torch.minimum(w_min, cur_min)
-            w_max = cur_max if w_max is None else torch.maximum(w_max, cur_max)
-    if w_min is None or w_max is None:
-        raise RuntimeError("No weights found to compute global weight scale.")
-    if symmetric:
-        max_abs = torch.maximum(w_max.abs(), w_min.abs())
-        s = torch.clamp(max_abs / qmax, min=eps).item()
-        zp = 0.0
-    else:
-        rng = torch.clamp(w_max - w_min, min=eps)
-        s = (rng / qmax).item()
-        zp = torch.round(-w_min / s).item()
-    return float(s), float(zp)
-
-@torch.no_grad()
-def _compute_global_activation_scale(
-    model: nn.Module,
-    bits: int,
-    symmetric: bool = True,
-    eps: float = 1e-8,
-) -> Tuple[float, float]:
-    qmin, qmax = _qmax_qmin(bits, symmetric)
-    a_min = None
-    a_max = None
-    found = False
-    for m in model.modules():
-        for attr in ("input_fake", "output_fake"):
-            if hasattr(m, attr) and isinstance(getattr(m, attr), CustomFakeQuantize):
-                fq = getattr(m, attr)
-                # Use observer statistics collected during warmup
-                found = True
-                cur_max = fq.running_max.detach()
-                a_max = cur_max if a_max is None else torch.maximum(a_max, cur_max)
-                if not symmetric:
-                    cur_min = fq.running_min.detach()
-                    a_min = cur_min if a_min is None else torch.minimum(a_min, cur_min)
-    if not found:
-        raise RuntimeError("No activation fake-quant modules found to compute global activation scale.")
-    if symmetric:
-        s = torch.clamp(a_max / qmax, min=eps).item()
-        zp = 0.0
-    else:
-        if a_min is None:
-            # Fallback: assume non-negative activations
-            a_min = torch.zeros_like(a_max)
-        rng = torch.clamp(a_max - a_min, min=eps)
-        s = (rng / qmax).item()
-        zp = torch.round(-a_min / s).item()
-    return float(s), float(zp)
-
-def _to_tensor_on(ref: torch.Tensor, val: float) -> torch.Tensor:
-    return torch.as_tensor(float(val), dtype=torch.float32, device=ref.device)
-
-def _set_or_register_buffer(mod: nn.Module, name: str, value: torch.Tensor) -> None:
-    # If already a registered buffer, update in-place
-    if name in mod._buffers and isinstance(mod._buffers[name], torch.Tensor):
-        mod._buffers[name].data.copy_(value)
-        return
-    # If an attribute exists (e.g., None), remove it before registering
-    if hasattr(mod, name):
-        try:
-            delattr(mod, name)
-        except Exception:
-            pass
-    try:
-        mod.register_buffer(name, value)
-    except KeyError:
-        # Fallback: set as a plain attribute
-        setattr(mod, name, value)
-
-@torch.no_grad()
-def _apply_global_weight_scale(model: nn.Module, scale: float, zero_point: float = 0.0) -> None:
-    """
-    Switch all Conv/Linear weight fake-quant modules to use a fixed global scale.
-    Safe when external_* already exist (updates instead of re-registering).
-    """
-    for m in model.modules():
-        if isinstance(m, (nn.Conv1d, nn.Linear)) and hasattr(m, "weight_fake") and isinstance(m.weight_fake, CustomFakeQuantize):
-            fq: CustomFakeQuantize = m.weight_fake
-            ref = fq.scale if isinstance(getattr(fq, "scale", None), torch.Tensor) else next(m.parameters()).detach()
-            _set_or_register_buffer(fq, "external_scale", _to_tensor_on(ref, scale))
-            _set_or_register_buffer(fq, "external_zero_point", _to_tensor_on(ref, zero_point))
-            fq.use_external = True
-            fq.frozen = True
-            fq.enabled = True
-
-@torch.no_grad()
-def _apply_global_activation_scale(model: nn.Module, scale: float, zero_point: float = 0.0) -> None:
-    """
-    Switch all activation fake-quant modules to use a fixed global scale.
-    Safe when external_* already exist (updates instead of re-registering).
-    """
-    for m in model.modules():
-        for attr in ("input_fake", "output_fake"):
-            if hasattr(m, attr) and isinstance(getattr(m, attr), CustomFakeQuantize):
-                fq: CustomFakeQuantize = getattr(m, attr)
-                ref = fq.scale if isinstance(getattr(fq, "scale", None), torch.Tensor) else next(m.parameters()).detach()
-                _set_or_register_buffer(fq, "external_scale", _to_tensor_on(ref, scale))
-                _set_or_register_buffer(fq, "external_zero_point", _to_tensor_on(ref, zero_point))
-                fq.use_external = True
-                fq.frozen = True
-                fq.enabled = True
+        avg_loss, acc = _derive_metrics(total_loss, len(loader), correct, total)
+        prec, rec, f1 = _multiclass_macro_prf1(cm)
+        return avg_loss, acc, prec, rec, f1
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Custom QAT for arbitrary bit-widths")
-    parser.add_argument("--config", required=True, help="Path to config (e.g., config/multiclass.yaml)")
-    parser.add_argument("--weights", default=None, help="Optional pretrained weights to initialize from")
-    parser.add_argument("--epochs", type=int, default=None, help="QAT epochs (overrides config/base.yaml)")
-    parser.add_argument("--save-preconvert", action="store_true", help="Save model weights before convert()")
+def export_hardware_weights(model: nn.Module, quantizer: HardwareConstrainedQuantizer, 
+                           out_path: str) -> None:
+    """Export quantized weights for hardware deployment"""
+    hw_weights = {}
+    
+    for name, param in model.named_parameters():
+        if 'weight' in name and param.dim() > 1:
+            # Apply final quantization
+            with torch.no_grad():
+                w_clipped = torch.clamp(param, quantizer.weight_min, quantizer.weight_max)
+                w_quantized = quantizer.quantize_weights(w_clipped)
+                hw_weights[name] = w_quantized.cpu().numpy()
+    
+    np.savez(out_path, **hw_weights)
+    print(f"[OK] Exported hardware weights to {out_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Simple QAT for hardware constraints")
+    parser.add_argument("--config", required=True, help="Path to config")
+    parser.add_argument("--weights", default=None, help="Pretrained weights to load")
+    parser.add_argument("--weight-quantization-method", choices=["linear", "log2"], default=None,
+                       help="Weight quantization method (overrides config)")
+    parser.add_argument("--weight-linear-quantization-bits", type=int, default=None, help="Weight linear quantization bits (overrides config)")
+    parser.add_argument("--weight-log2-quantization-num-levels", type=int, default=None, help="Weight log2 quantization levels (overrides config)")
+    parser.add_argument("--weight-min", type=float, default=None, help="Minimum weight value (overrides config)")
+    parser.add_argument("--weight-max", type=float, default=None, help="Maximum weight value (overrides config)")
+    parser.add_argument("--act-quantization-bits", type=int, default=None, help="Activation quantization bits (overrides config)")
+    parser.add_argument("--act-max", type=float, default=None, help="Maximum activation value (overrides config)")
+    parser.add_argument("--epochs", type=int, default=None, help="QAT training epochs (overrides config)")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate for QAT (overrides config)")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size for QAT (overrides config)")
+    
     args = parser.parse_args()
-
-    t0 = time()
+    
+    # Load config and setup
     cfg = load_config(args.config)
     qat_cfg = cfg.get("qat", {})
-    wb = int(qat_cfg.get("weight_bits", 8))
-    ab = int(qat_cfg.get("act_bits", 8))
-    weight_symmetric = bool(qat_cfg.get("weight_symmetric", qat_cfg.get("symmetric", True)))
-    act_symmetric = bool(qat_cfg.get("act_symmetric", qat_cfg.get("symmetric", True)))
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     task_type = cfg["task"]["type"]
-
-    train_batch_size = cfg["qat"].get("batch_size", 32)
-    train_epochs = args.epochs if args.epochs is not None else cfg["qat"].get("num_epochs", 5)
-    lr = cfg["qat"].get("learning_rate", 1e-3)
-    warmup_epochs = int(cfg["qat"].get("warmup_epochs", 1))
-
-    # Optional QAT-specific dropout override
-    qat_dropout = qat_cfg.get("dropout", None)
-    if qat_dropout is not None:
-        cfg.setdefault("model", {})
-        orig_do = cfg["model"].get("dropout", None)
-        cfg["model"]["dropout"] = float(qat_dropout)
-        print(f"[QAT] Overriding model.dropout: {orig_do} -> {qat_dropout}")
-
-    # Global fixed-scale options (derived from warmup; no scales in YAML)
-    weight_use_global = bool(qat_cfg.get("weight_use_global_scale", False))
-    act_use_global = bool(qat_cfg.get("act_use_global_scale", False))
-
-    # Always request all splits
-    dl_train, dl_val, dl_test = make_datasets(cfg, which="all", batch_size=train_batch_size)
-    num_classes = get_num_classes(cfg)
-    batch0 = next(iter(dl_train))
-    if isinstance(batch0, (list, tuple)):
-        x0 = batch0[0]
-    elif isinstance(batch0, dict):
-        x0 = batch0["x"]
+    
+    # Get QAT parameters from config with command-line overrides
+    weight_quantization_method = args.weight_quantization_method if args.weight_quantization_method is not None else qat_cfg.get("weight_quantization_method", "linear")
+    weight_linear_quantization_bits = args.weight_linear_quantization_bits if args.weight_linear_quantization_bits is not None else qat_cfg.get("weight_linear_quantization_bits", 4)
+    weight_log2_quantization_num_levels = args.weight_log2_quantization_num_levels if args.weight_log2_quantization_num_levels is not None else qat_cfg.get("weight_log2_quantization_num_levels", 4)
+    weight_min = args.weight_min if args.weight_min is not None else qat_cfg.get("weight_min", -1.0)
+    weight_max = args.weight_max if args.weight_max is not None else qat_cfg.get("weight_max", 1.0)
+    act_quantization_bits = args.act_quantization_bits if args.act_quantization_bits is not None else qat_cfg.get("act_quantization_bits", 10)
+    act_max = args.act_max if args.act_max is not None else qat_cfg.get("act_max", 1024.0)
+    epochs = args.epochs if args.epochs is not None else qat_cfg.get("num_epochs", 5)
+    lr = args.lr if args.lr is not None else qat_cfg.get("learning_rate", 1e-4)
+    batch_size = args.batch_size if args.batch_size is not None else qat_cfg.get("batch_size", 32)
+    
+    # Device and dataloader settings
+    device_cfg = qat_cfg.get("device", "auto")
+    if device_cfg == "auto":
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     else:
-        x0 = batch0
-    sample_x = x0[0] if hasattr(x0, "dim") and x0.dim() == 3 else x0  # (C,T)
-    model = DilatedTCN.from_config(cfg)
-
-    if args.weights:
-        model = load_state_dict_forgiving(model, args.weights, device)
-
-    # Fold BatchNorm before QAT (as per paper: "batch normalization layers folded into the weights")
-    fold_bn = bool(qat_cfg.get("fold_batchnorm", True))
-    if fold_bn:
-        print("[QAT] Folding BatchNorm layers into Conv weights...")
-        model = fold_batchnorm(model)
-
-    model.to(device)
-    # Apply QAT with per-channel/per-tensor observers during warmup
-    model = apply_custom_fake_quant(
-        model, wb, ab,
-        weight_symmetric=weight_symmetric,
-        act_symmetric=act_symmetric,
-        weight_use_global=False,          # start with observers
-        act_use_global=False
+        device = torch.device(device_cfg)
+    
+    num_workers = qat_cfg.get("num_workers", 2)
+    pin_memory = qat_cfg.get("pin_memory", True)
+    persistent_workers = qat_cfg.get("persistent_workers", True)
+    prefetch_factor = qat_cfg.get("prefetch_factor", 2)
+    
+    print(f"[QAT] Weight method: {weight_quantization_method}, Weight bits: {weight_linear_quantization_bits}, "
+          f"Act bits: {act_quantization_bits}, Act max: {act_max}, Weight range: [{weight_min}, {weight_max}]")
+    print(f"[QAT] Device: {device}, Workers: {num_workers}, Pin memory: {pin_memory}")
+    
+    # Create datasets
+    train_loader, val_loader, test_loader = create_qat_dataloaders(
+        cfg, batch_size, num_workers, pin_memory, persistent_workers, prefetch_factor
     )
-
+    num_classes = get_num_classes(cfg)
+    
+    # Create model
+    model = DilatedTCN.from_config(cfg)
+    if args.weights:
+        checkpoint = torch.load(args.weights, map_location='cpu')
+        model.load_state_dict(checkpoint, strict=False)
+        print(f"[QAT] Loaded pretrained weights from {args.weights}")
+    
+    model.to(device)
+    
+    # Create quantizer
+    quantizer = HardwareConstrainedQuantizer(
+        method=weight_quantization_method,
+        bits=max(weight_linear_quantization_bits, act_quantization_bits), 
+        activation_max=act_max,
+        log2_levels=weight_log2_quantization_num_levels,
+        weight_min=weight_min,
+        weight_max=weight_max
+    )
+    
+    # Apply QAT
+    model = apply_hardware_qat(model, quantizer)
+    
+    # Optimizer and loss
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss() if task_type == "multiclass" else nn.BCEWithLogitsLoss()
-
-    print("[QAT] Starting training...")
-    history, val_history = train_qat(
-        model, dl_train, dl_val, optimizer, criterion, device,
-        epochs=train_epochs, task_type=task_type, num_classes=num_classes,
-        threshold=0.5, warmup_epochs=warmup_epochs,
-        wb=wb, ab=ab,
-        weight_use_global=weight_use_global, act_use_global=act_use_global,
-        weight_symmetric=weight_symmetric, act_symmetric=act_symmetric
+    
+    print(f"[QAT] Starting training for {epochs} epochs...")
+    train_hist, val_hist = train_qat_simple(
+        model, quantizer, train_loader, val_loader, optimizer, criterion,
+        device, epochs, task_type, num_classes, weight_clipping=True,
+        weight_min=weight_min, weight_max=weight_max
     )
-
-    # ---- Test evaluation (like train/train.py) ----
-    test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate(model, dl_test, criterion, device, task_type, num_classes)
-    test_metrics = {"loss": float(test_loss), "acc": float(test_acc), "prec": float(test_prec), "rec": float(test_rec), "f1": float(test_f1)}
-    print(f"[TEST] Loss: {test_loss:.4f}  Acc: {test_acc:.4f}  P: {test_prec:.4f}  R: {test_rec:.4f}  F1: {test_f1:.4f}")
-
-    # Optional: confusion matrix plots for multiclass
-    if task_type == "multiclass":
-        class_names = getattr(dl_train.dataset, "class_names", [str(i) for i in range(num_classes)])
-        cm = [[0] * num_classes for _ in range(num_classes)]
-        with torch.no_grad():
-            for batch in dl_test:
-                if isinstance(batch, (list, tuple)):
-                    x, y = batch[0], batch[1]
-                elif isinstance(batch, dict):
-                    x, y = batch["x"], batch["y"]
-                else:
-                    raise RuntimeError("Unexpected batch format")
-                x = x.to(device)
-                targets = y.long().to(device)
-                logits = model(x)
-                preds = torch.argmax(logits, dim=1)
-                cm = _multiclass_confusion_add(cm, preds, targets, num_classes)
-
-        plots_dir = os.path.join(cfg["output"]["plots_dir"], "training")
-        os.makedirs(plots_dir, exist_ok=True)
-        plot_test_confusion_matrix(cm, class_names=class_names, normalize=False,
-                                   save_path=os.path.join(plots_dir, f"test_confusion_matrix_qat_{wb}w{ab}a.png"))
-        plot_test_confusion_matrix(cm, class_names=class_names, normalize=True,
-                                   save_path=os.path.join(plots_dir, f"test_confusion_matrix_qat_{wb}w{ab}a_norm.png"))
-
-    if args.save_preconvert:
-        pre_path = os.path.join(cfg["output"]["weights_dir"], f"model_weights_qat_{wb}w{ab}a_preconvert.pt")
-        torch.save(model.state_dict(), pre_path)
-        print(f"[INFO] Saved pre-convert model weights to {pre_path}")
-
-    weights_dir = cfg["output"]["weights_dir"]
-    os.makedirs(weights_dir, exist_ok=True)
-    fname = f"model_weights_qat_{wb}w{ab}a.pt"
-    out_path = os.path.join(weights_dir, fname)
-    torch.save(model.state_dict(), out_path)
-    print(f"[OK] Saved QAT weights to {out_path}")
-
-    npz_path = os.path.splitext(out_path)[0] + ".npz"
-    # Use local exporter; let it read the applied global scale from the model when use_global=True
-    export_quant_npz_from_model(
-        model, npz_path, bits=wb,
-        per_channel=(not weight_use_global),
-        symmetric_weights=weight_symmetric,
-        use_global=weight_use_global,
-        global_scale=None,  # auto-read from model.weight_fake.external_scale if present
-        global_zero_point=0.0
+    
+    # Test evaluation
+    test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate_qat_simple(
+        model, test_loader, criterion, device, task_type, num_classes
     )
-    print(f"[OK] Exported quantized weights to {npz_path}")
-
-    plots_dir = os.path.join(cfg["output"]["plots_dir"], "training")
+    print(f"[TEST] Loss: {test_loss:.4f} Acc: {test_acc:.4f} F1: {test_f1:.4f}")
+    
+    # Save metrics and plots
+    plots_dir = cfg["output"]["plots_dir"]
     os.makedirs(plots_dir, exist_ok=True)
-    fig_path = os.path.join(plots_dir, f"metrics_qat_{wb}w{ab}a.png")
+    
+    # Save training metrics plot
+    plot_metrics(train_hist, val_hist, 
+                save_path=os.path.join(plots_dir, "qat_metrics.png"),
+                title_prefix=f"QAT Training ({weight_quantization_method} {weight_linear_quantization_bits}bit)")
+    
+    # Save metrics to CSV
+    csv_path = os.path.join(plots_dir, "qat_metrics.csv")
+    with open(csv_path, 'w') as f:
+        # Write header
+        f.write("epoch,train_loss,train_acc,train_f1,val_loss,val_acc,val_f1\\n")
+        # Write data
+        for epoch in range(len(train_hist["loss"])):
+            f.write(f"{epoch + 1},{train_hist['loss'][epoch]:.6f},{train_hist['acc'][epoch]:.6f},"
+                   f"{train_hist['f1'][epoch]:.6f},{val_hist['loss'][epoch]:.6f},"
+                   f"{val_hist['acc'][epoch]:.6f},{val_hist['f1'][epoch]:.6f}\\n")
+    print(f"[METRICS] Saved to {csv_path} and {os.path.join(plots_dir, 'qat_metrics.png')}")
+    
+    # Save results
+    output_dir = cfg["output"]["weights_dir"]
+    os.makedirs(output_dir, exist_ok=True)
+    
+    model_path = os.path.join(output_dir, f"qat_simple_{weight_quantization_method}_{weight_linear_quantization_bits}bit.pt")
+    torch.save(model.state_dict(), model_path)
+    
+    weights_path = os.path.join(output_dir, f"qat_simple_{weight_quantization_method}_{weight_linear_quantization_bits}bit.npz")
+    export_hardware_weights(model, quantizer, weights_path)
+    
+    print(f"[DONE] QAT training completed. Model saved to {model_path}")
 
-    plot_metrics(history, val_history, test_metrics=test_metrics, save_path=fig_path, title_prefix=f"QAT {wb}w{ab}a")
-    print(f"[OK] Saved training plot to {fig_path}")
-    print(f"[DONE] QAT completed in {time() - t0:.1f} seconds.")
 
 if __name__ == "__main__":
     main()

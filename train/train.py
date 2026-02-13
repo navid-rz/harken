@@ -88,6 +88,22 @@ class Trainer:
         lr = float(cfg["train"]["learning_rate"])
         weight_decay = float(cfg["train"]["weight_decay"])
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+        
+        # Weight constraints configuration
+        self.constrain_weights = bool(cfg["train"].get("constrain_weights", False))
+        self.weight_min = float(cfg["train"].get("weight_min", -1.0))
+        self.weight_max = float(cfg["train"].get("weight_max", 1.0))
+        print(f"[Weight Constraints] Enabled: {self.constrain_weights}, Range: [{self.weight_min}, {self.weight_max}]")
+        
+        # Activation constraints configuration
+        self.constrain_act = bool(cfg["train"].get("constrain_act", False))
+        self.act_min = float(cfg["train"].get("act_min", 0.0))
+        self.act_max = float(cfg["train"].get("act_max", 1024.0))
+        self.activation_hooks = []  # Store hook handles for cleanup
+        print(f"[Activation Constraints] Enabled: {self.constrain_act}, Range: [{self.act_min}, {self.act_max}]")
+        
+        if self.constrain_act:
+            self._apply_activation_constraint_hooks()
 
         # Loss
         if self.task_type == "binary":
@@ -194,6 +210,16 @@ class Trainer:
             for batch_x, batch_y in iterator:
                 num_batches += 1
                 batch_x = batch_x.to(self.device, non_blocking=self.pin_memory)
+                
+                # Scale input features to activation constraint range if enabled
+                if self.constrain_act:
+                    # Get current min/max of batch features
+                    batch_min = batch_x.min()
+                    batch_max = batch_x.max()
+                    # Scale features to [act_min, act_max] range
+                    if batch_max > batch_min:  # Avoid division by zero
+                        batch_x = (batch_x - batch_min) / (batch_max - batch_min)  # Normalize to [0,1]
+                        batch_x = batch_x * (self.act_max - self.act_min) + self.act_min  # Scale to [act_min, act_max]
 
                 if self.task_type == "binary":
                     targets = batch_y.float().unsqueeze(1).to(self.device)
@@ -207,6 +233,10 @@ class Trainer:
                     self.optimizer.zero_grad()
                     loss.backward()
                     self.optimizer.step()
+                    
+                    # Apply weight constraints if enabled
+                    if self.constrain_weights:
+                        self._constrain_weights()
 
                 total_loss += loss.item()
 
@@ -229,6 +259,33 @@ class Trainer:
             avg_loss, acc = _derive_metrics(total_loss, num_batches, correct, total)
             macro_p, macro_r, macro_f1 = _multiclass_macro_prf1(cm)
             return avg_loss, acc, macro_p, macro_r, macro_f1
+
+    def _constrain_weights(self) -> None:
+        """Constrain all weight parameters to specified range for hardware constraints."""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if 'weight' in name and param.dim() > 1:  # Only weight matrices, not biases
+                    param.clamp_(self.weight_min, self.weight_max)
+                    
+    def _apply_activation_constraint_hooks(self) -> None:
+        """Apply forward hooks to constrain activations between act_min and act_max."""
+        def constraint_hook(module, input, output):
+            # Constrain output to [act_min, act_max] range
+            return torch.clamp(output, self.act_min, self.act_max)
+        
+        # Apply hooks to all ReLU layers
+        for name, module in self.model.named_modules():
+            if isinstance(module, nn.ReLU):
+                handle = module.register_forward_hook(constraint_hook)
+                self.activation_hooks.append(handle)
+                print(f"[Activation Constraints] Applied hook to {name}")
+                
+    def _remove_activation_constraint_hooks(self) -> None:
+        """Remove all activation constraint hooks."""
+        for handle in self.activation_hooks:
+            handle.remove()
+        self.activation_hooks.clear()
+        print(f"[Activation Constraints] Removed all hooks")
 
     # ---------- Threshold search (binary only) ----------
     def find_best_threshold(self, steps: int = 101) -> Tuple[float, float]:

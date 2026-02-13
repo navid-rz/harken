@@ -75,23 +75,24 @@ train:
   prefetch_factor: 2         # batches prefetched per worker
 
 qat:
-  # quant config
-  weight_bits: 3
-  act_bits: 5
-  weight_symmetric: true
-  act_symmetric: false
-
-  # Use globally fixed scales after warmup (derive from data/observers)
-  weight_use_global_scale: true
-  act_use_global_scale: true
-  warmup_epochs: 1
-
-  # training hyperparams
+  # Quantization config for hardware constraints
+  weight_quantization_method: linear    # "linear" | "log2" weight quantization
+  weight_linear_quantization_bits: 3    # Weight linear quantization bits
+  weight_log2_quantization_num_levels: 4  # Weight log2 quantization levels
+  weight_min: -1.0                     # Minimum weight value
+  weight_max: 1.0                      # Maximum weight value
+  act_quantization_bits: 5             # Activation quantization bits (always linear)
+  act_max: 1024.0                      # Max activation value (hardware constraint)
   batch_size: 32
   num_epochs: 5
   learning_rate: 1.0e-5
-  # Optional: override model.dropout during QAT
-  dropout: 0.10
+  device: auto                         # "auto" | "cuda" | "cpu"
+  
+  # DataLoader performance knobs
+  num_workers: 2
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
 
 output:
   weights_dir: "checkpoints"

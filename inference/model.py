@@ -36,16 +36,16 @@ def get_mfcc_section(cfg: dict) -> dict:
 
 def preprocess_wave(y: np.ndarray, sr: int, cfg_mfcc: dict, fixed_duration_s: float) -> torch.Tensor:
     """
-    Preprocess audio waveform to MFCC features.
+    Preprocess audio waveform to features (MFCC or log-mel).
     
     Args:
         y: Audio waveform (1D numpy array)
         sr: Sample rate
-        cfg_mfcc: MFCC configuration dict
+        cfg_mfcc: Feature configuration dict
         fixed_duration_s: Target duration in seconds
         
     Returns:
-        MFCC features as (channels, time) tensor
+        Features as (channels, time) tensor
     """
     # Pad / trim to fixed duration
     target_len = int(fixed_duration_s * sr)
@@ -55,24 +55,42 @@ def preprocess_wave(y: np.ndarray, sr: int, cfg_mfcc: dict, fixed_duration_s: fl
         y = y[:target_len]
 
     # Support both n_mfcc and n_features naming
-    n_mfcc = int(cfg_mfcc.get("n_mfcc", cfg_mfcc.get("n_features", 28)))
+    n_features = int(cfg_mfcc.get("n_mfcc", cfg_mfcc.get("n_features", 28)))
     frame_length_s = float(cfg_mfcc["frame_length_s"])
     hop_length_s = float(cfg_mfcc["hop_length_s"])
     n_fft = int(round(frame_length_s * sr))
     hop_length = int(round(hop_length_s * sr))
-
-    # Librosa MFCC (match training assumptions)
-    mfcc = librosa.feature.mfcc(
-        y=y,
-        sr=sr,
-        n_mfcc=n_mfcc,
-        n_fft=n_fft,
-        hop_length=hop_length,
-        center=True
-    )  # shape (n_mfcc, T)
+    
+    # Extract features based on type
+    feature_type = cfg_mfcc.get("type", "mfcc")
+    
+    if feature_type == "log-mel":
+        # Log-mel spectrogram (matches training preprocessing)
+        mel_spec = librosa.feature.melspectrogram(
+            y=y,
+            sr=sr,
+            n_mels=n_features,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            center=True
+        )
+        # Natural log (standard for ML, not dB scale)
+        features = np.log(mel_spec + 1e-10)  # Add epsilon to avoid log(0)
+        # Shift to [0, max] range for unsigned hardware compatibility
+        features = features - features.min()
+    else:
+        # Traditional MFCCs
+        features = librosa.feature.mfcc(
+            y=y,
+            sr=sr,
+            n_mfcc=n_features,
+            n_fft=n_fft,
+            hop_length=hop_length,
+            center=True
+        )  # shape (n_features, T)
 
     # (C, T) float32 tensor
-    feat = torch.from_numpy(mfcc).float()
+    feat = torch.from_numpy(features).float()
     return feat
 
 
@@ -119,6 +137,25 @@ class KeywordModel:
         self.model = DilatedTCN.from_config(self.cfg)
         self.model = load_state_dict_forgiving(self.model, weights_path, device)
         self.model.to(device).eval()
+        
+        # Hardware constraints configuration (similar to train.py)
+        train_cfg = self.cfg.get("train", {})
+        self.constrain_weights = bool(train_cfg.get("constrain_weights", False))
+        self.weight_min = float(train_cfg.get("weight_min", -1.0))
+        self.weight_max = float(train_cfg.get("weight_max", 1.0))
+        self.constrain_act = bool(train_cfg.get("constrain_act", False))
+        self.act_min = float(train_cfg.get("act_min", 0.0))
+        self.act_max = float(train_cfg.get("act_max", 1024.0))
+        self.activation_hooks = []  # Store hook handles for cleanup
+        
+        print(f"[Inference] Weight Constraints: {self.constrain_weights}, Range: [{self.weight_min}, {self.weight_max}]")
+        print(f"[Inference] Activation Constraints: {self.constrain_act}, Range: [{self.act_min}, {self.act_max}]")
+        
+        # Apply constraints if enabled
+        if self.constrain_weights:
+            self._apply_weight_constraints()
+        if self.constrain_act:
+            self._apply_activation_constraint_hooks()
 
     def preprocess(self, audio: np.ndarray) -> torch.Tensor:
         """
@@ -133,8 +170,14 @@ class KeywordModel:
         return preprocess_wave(audio, self.sr, self.mfcc_cfg, self.fixed_duration_s)
 
     def prepare_input(self, feat: torch.Tensor) -> torch.Tensor:
-        """Add batch dimension: (C, T) -> (1, C, T)"""
-        return feat.unsqueeze(0)
+        """Add batch dimension and apply input scaling: (C, T) -> (1, C, T)"""
+        # Add batch dimension
+        feat_batch = feat.unsqueeze(0)
+        
+        # Apply input feature scaling if activation constraint is enabled
+        feat_scaled = self._scale_input_features(feat_batch)
+        
+        return feat_scaled
 
     @torch.no_grad()
     def predict(self, feat: torch.Tensor, top_k: int = 3) -> List[Tuple[str, float]]:
@@ -211,6 +254,49 @@ class KeywordModel:
         feat = self.preprocess(audio)
         return self.predict_full(feat)
 
+    def _apply_weight_constraints(self) -> None:
+        """Apply weight constraints to loaded model (inference-time enforcement)."""
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if 'weight' in name and param.dim() > 1:  # Only weight matrices, not biases
+                    param.clamp_(self.weight_min, self.weight_max)
+                    
+    def _apply_activation_constraint_hooks(self) -> None:
+        """Apply forward hooks to constrain activations between act_min and act_max."""
+        def constraint_hook(module, input, output):
+            # Constrain output to [act_min, act_max] range
+            return torch.clamp(output, self.act_min, self.act_max)
+        
+        # Apply hooks to all ReLU layers
+        for name, module in self.model.named_modules():
+            if isinstance(module, torch.nn.ReLU):
+                handle = module.register_forward_hook(constraint_hook)
+                self.activation_hooks.append(handle)
+                print(f"[Inference] Applied activation constraint hook to {name}")
+                
+    def _remove_activation_constraint_hooks(self) -> None:
+        """Remove all activation constraint hooks."""
+        for handle in self.activation_hooks:
+            handle.remove()
+        self.activation_hooks.clear()
+        print(f"[Inference] Removed activation constraint hooks")
+
+    def _scale_input_features(self, features: torch.Tensor) -> torch.Tensor:
+        """Scale input features to activation constraint range if enabled."""
+        if not self.constrain_act:
+            return features
+            
+        # Get current min/max of features
+        feat_min = features.min()
+        feat_max = features.max()
+        
+        # Scale features to [act_min, act_max] range
+        if feat_max > feat_min:  # Avoid division by zero
+            features = (features - feat_min) / (feat_max - feat_min)  # Normalize to [0,1]
+            features = features * (self.act_max - self.act_min) + self.act_min  # Scale to [act_min, act_max]
+            
+        return features
+
     @torch.no_grad()
     def evaluate_dataloader(self, dataloader: DataLoader, device: torch.device = None, 
                            threshold: float = 0.5, verbose: bool = True) -> Dict[str, float]:
@@ -274,6 +360,10 @@ class KeywordModel:
                 # Move data to device
                 batch_features = batch_features.to(device)
                 batch_labels = batch_labels.to(device)
+                
+                # Scale input features to activation constraint range if enabled
+                if self.constrain_act:
+                    batch_features = self._scale_input_features(batch_features)
                 
                 # Forward pass through model
                 logits = self.model(batch_features)
