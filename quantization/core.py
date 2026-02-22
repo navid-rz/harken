@@ -1,4 +1,4 @@
-# Added from analysis/plot_weights.py
+
 
 import os
 import torch
@@ -324,21 +324,117 @@ def _quantize_weights_log2_scheme(
         return np.concatenate(codes, axis=0) if return_codes else None
 
 
+def _quantize_model_weights_log2(
+    model: torch.nn.Module,
+    num_log2_levels: int,
+    scheme: str,
+    global_percentile: float,
+    normalize_to_unit: bool
+) -> torch.nn.Module:
+    """
+    Helper function to apply log2 quantization to model weights.
+    
+    Args:
+        model: Model to quantize (already on CPU)
+        num_log2_levels: Number of positive/negative levels for log2 quantization
+        scheme: One of "per_tensor", "per_channel", "global"
+        global_percentile: Percentile for global scale computation
+        normalize_to_unit: If True, normalize to [-1,+1] range
+        
+    Returns:
+        Quantized model (modified in-place)
+    """
+    if scheme == "global":
+        # Collect all weights for global log2 scale computation
+        all_weights = []
+        for module in model.modules():
+            if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
+                all_weights.append(module.weight.data.cpu().numpy().flatten())
+        
+        if all_weights:
+            all_weights_arr = np.concatenate(all_weights)
+            global_max = np.percentile(np.abs(all_weights_arr), global_percentile)
+            
+            # Apply global log2 quantization to each layer
+            for module in model.modules():
+                if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
+                    w_np = module.weight.data.cpu().numpy()
+                    w_quantized = quantize_to_log2(w_np, num_log2_levels, global_max, normalize_to_unit)
+                    module.weight.data = torch.from_numpy(w_quantized).float()
+    
+    elif scheme == "per_tensor":
+        # Per-tensor log2 quantization
+        for module in model.modules():
+            if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
+                w_np = module.weight.data.cpu().numpy()
+                max_abs = np.abs(w_np).max()
+                w_quantized = quantize_to_log2(w_np, num_log2_levels, max_abs, normalize_to_unit)
+                module.weight.data = torch.from_numpy(w_quantized).float()
+    
+    elif scheme == "per_channel":
+        # Per-channel log2 quantization
+        for module in model.modules():
+            if isinstance(module, (torch.nn.Conv1d, torch.nn.Linear)) and hasattr(module, "weight"):
+                w = module.weight.data
+                if w.dim() < 2:
+                    # Fallback to per-tensor for 1D weights
+                    w_np = w.cpu().numpy()
+                    max_abs = np.abs(w_np).max()
+                    w_quantized = quantize_to_log2(w_np, num_log2_levels, max_abs, normalize_to_unit)
+                    module.weight.data = torch.from_numpy(w_quantized).float()
+                    continue
+                
+                # Per-channel quantization
+                oc = w.shape[0]
+                w_np = w.cpu().numpy()
+                w_flat = w_np.reshape(oc, -1)
+                
+                # Quantize each channel separately
+                quantized_channels = []
+                for ch_data in w_flat:
+                    max_abs = np.abs(ch_data).max()
+                    ch_quantized = quantize_to_log2(ch_data, num_log2_levels, max_abs, normalize_to_unit)
+                    quantized_channels.append(ch_quantized)
+                
+                w_quantized = np.stack(quantized_channels).reshape(w_np.shape)
+                module.weight.data = torch.from_numpy(w_quantized).float()
+    
+    return model
+
+
 def quantize_model_weights(
     model: torch.nn.Module,
     bits: int = 8,
     scheme: str = "per_tensor",
     symmetric: bool = True,
     global_percentile: float = 100.0,
-    normalize_to_unit: bool = False
+    normalize_to_unit: bool = False,
+    method: str = "linear",
+    num_log2_levels: int = 8
 ) -> torch.nn.Module:
     """
     Quantize weights of all Conv1d/Linear layers in the model using the specified scheme.
     
     Args:
+        model: Model to quantize
+        bits: Bitwidth for linear quantization (ignored for log2 method)
+        scheme: One of "per_tensor", "per_channel", "global"
+        symmetric: Use symmetric quantization (only for linear method)
+        global_percentile: Percentile for global scale computation
         normalize_to_unit: If True, normalize quantized weights to [-1,+1] range for hardware
+        method: Quantization method - "linear" (default) or "log2"
+        num_log2_levels: Number of positive/negative levels for log2 quantization
+    
+    Returns:
+        Quantized model (modified in-place and returned)
     """
     model = model.cpu()
+    
+    # Route to appropriate quantization method
+    if method == "log2":
+        return _quantize_model_weights_log2(model, num_log2_levels, scheme, global_percentile, normalize_to_unit)
+    
+    # Linear quantization (original implementation)
     if symmetric:
         qmin = -(2 ** (bits - 1))
         qmax_w = (2 ** (bits - 1)) - 1

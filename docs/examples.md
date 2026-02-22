@@ -15,6 +15,9 @@
 **Training**
 - **Run trainer as module:** python -m train.train --config config/base.yaml
 
+**Inference Evaluation and Post-Training Quantization
+- **Run inference evaluation with linearly quantized weights, same weight and activation limits are applied as specified in config.yaml train section** python -m analysis.eval_inf_ptq --config "config\experiments\logmel16_agc_no_batch_norm.yaml" --weights "checkpoints\logmel16_agc_no_batch_norm\model_weights_fp.pt" --quant-method linear --linear-bits "8,7,6,5,4,3" --verbose
+
 **Quantization-Aware Training (QAT)**
 - **Train with 4-bit unsigned activations and 8-bit signed weights** (paper setup):
   ```bash
@@ -30,9 +33,18 @@
   #   batch_size: 32
   #   learning_rate: 0.0001
   
-  python -m train.qat --config config/base.yaml --weights checkpoints/model_ckpt_fp.pt
+  python -m train.qat --config "config\experiments\logmel16_agc_no_batch_norm.yaml" --weights "checkpoints\logmel16_agc_no_batch_norm\model_weights_fp.pt" --epochs 2
   ```
   Automatically folds BatchNorm into Conv layers before QAT, then trains with fake-quantization nodes.
+
+- **Plot trained quantized weights**
+  python -m analysis.plot_quant_npz --npz "checkpoints\logmel16_agc_no_batch_norm\qat\qat_weights_linear_4bit_act_10bit.npz" --outdir "plots\logmel16_agc_no_batch_norm\qat"
+
+**Run the Demo App**
+  python -m demo.app --config "config\experiments\logmel16_agc_no_batch_norm.yaml" --weights "checkpoints\logmel16_agc_no_batch_norm\qat\qat_weights_linear_4bit_act_10bit.npz"
+
+**Post QAT Noise Injected Inference Evaluation**
+  python -m analysis.eval_inf_weight_analog_error --config "config\experiments\logmel16_agc_no_batch_norm.yaml" --weights "checkpoints\logmel16_agc_no_batch_norm\qat\qat_weights_linear_4bit_act_10bit.npz" --analog-weight-error "0.0,0.1,0.2,0.3,0.5,0.7,1.0,1.5,2.0" --error-type gaussian --num-trials 3 --dataset val --verbose --save-results
 
 - **Fold BatchNorm manually (for inference deployment):**
   ```python

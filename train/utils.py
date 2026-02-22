@@ -33,21 +33,48 @@ def load_state_dict(path: str) -> Dict[str, torch.Tensor]:
 
 
 def load_state_dict_forgiving(model: M, path: str, device: torch.device) -> M:
-    # Use load_state_dict to handle checkpoint wrappers (state_dict/model keys)
-    obj = torch.load(path, map_location=device)
-    if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
-        state_dict = obj["state_dict"]
-    elif isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
-        state_dict = obj["model"]
-    elif isinstance(obj, dict):
-        state_dict = obj
+    if path.endswith('.npz'):
+        # Load quantized weights from NPZ file (from QAT export_hardware_weights)
+        print("[INFO] Loading quantized weights from NPZ file")
+        npz_weights = np.load(path, allow_pickle=True)
+        
+        # Convert numpy arrays to PyTorch tensors and load into model
+        state_dict = {}
+        for layer_name in npz_weights.files:
+            # Convert numpy array to PyTorch tensor
+            weight_tensor = torch.from_numpy(npz_weights[layer_name]).float()
+            state_dict[layer_name] = weight_tensor
+        
+        model_state = model.state_dict()
+        filtered = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
+        model_state.update(filtered)
+        model.load_state_dict(model_state)
+        print(f"[INFO] Loaded NPZ weights: matched {len(filtered)}/{len(model_state)} tensors")
+        
+        # Report quantization info
+        for name, weights in filtered.items():
+            unique_vals = len(torch.unique(weights))
+            print(f"[INFO] {name}: {unique_vals} unique quantized values, range [{weights.min():.6f}, {weights.max():.6f}]")
+        
     else:
-        raise ValueError("Unsupported weights file format: expected a state_dict or checkpoint dict.")
+        # Use load_state_dict to handle checkpoint wrappers (state_dict/model keys)
+        obj = torch.load(path, map_location=device)
+        if isinstance(obj, dict) and "state_dict" in obj and isinstance(obj["state_dict"], dict):
+            state_dict = obj["state_dict"]
+        elif isinstance(obj, dict) and "model" in obj and isinstance(obj["model"], dict):
+            state_dict = obj["model"]
+        elif isinstance(obj, dict):
+            state_dict = obj
+        else:
+            raise ValueError("Unsupported weights file format: expected a state_dict or checkpoint dict.")
+        
+        model_state = model.state_dict()
+        filtered = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
+        model_state.update(filtered)
+        model.load_state_dict(model_state)
+        print(f"[INFO] Loaded weights (forgiving): matched {len(filtered)}/{len(model_state)} tensors")
     
-    model_state = model.state_dict()
-    filtered = {k: v for k, v in state_dict.items() if k in model_state and v.shape == model_state[k].shape}
-    model_state.update(filtered)
-    model.load_state_dict(model_state)
+    return model
     print(f"[INFO] Loaded weights (forgiving): matched {len(filtered)}/{len(model_state)} tensors")
     return model
 

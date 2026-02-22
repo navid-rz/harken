@@ -213,13 +213,12 @@ class Trainer:
                 
                 # Scale input features to activation constraint range if enabled
                 if self.constrain_act:
-                    # Get current min/max of batch features
-                    batch_min = batch_x.min()
-                    batch_max = batch_x.max()
-                    # Scale features to [act_min, act_max] range
-                    if batch_max > batch_min:  # Avoid division by zero
-                        batch_x = (batch_x - batch_min) / (batch_max - batch_min)  # Normalize to [0,1]
-                        batch_x = batch_x * (self.act_max - self.act_min) + self.act_min  # Scale to [act_min, act_max]
+                    # Per-sample normalization to [act_min, act_max] (matches eval_inf_ptq.py)
+                    dims = tuple(range(1, batch_x.dim()))
+                    min_vals = batch_x.amin(dim=dims, keepdim=True)
+                    max_vals = batch_x.amax(dim=dims, keepdim=True)
+                    denom = (max_vals - min_vals).clamp(min=1e-8)
+                    batch_x = (batch_x - min_vals) / denom * (self.act_max - self.act_min) + self.act_min
 
                 if self.task_type == "binary":
                     targets = batch_y.float().unsqueeze(1).to(self.device)

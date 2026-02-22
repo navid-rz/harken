@@ -1,21 +1,22 @@
+
 """
 Simplified QAT for hardware constraints:
 - Weights: [-1, +1] range with n-bit linear or log2 quantization
-- Activations: [0, act_max] range with linear quantization only  
+- Activations: [0, act_max] range with linear quantization only
 - No batch normalization support (assumes norm: none)
 - Weight clipping integrated
 """
 
 import os
 import argparse
+from typing import Optional, Tuple, Dict, Any
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
-from tqdm import tqdm
-from time import time
 import numpy as np
-from typing import Optional, Tuple, Dict, Any
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 from train.utils import (
@@ -24,8 +25,8 @@ from train.utils import (
 from config import load_config
 from model.model import DilatedTCN
 from data_loader.utils import make_datasets, get_num_classes
-from analysis.plot_metrics import plot_metrics, plot_test_confusion_matrix
-from quantization.core import quantize_model_weights, compute_scale_symmetric, quantize_tensor
+from analysis.plot_metrics import plot_metrics
+from quantization.core import quantize_tensor, qmax_for_bits, compute_log2_levels, quantize_to_log2
 
 
 def create_qat_dataloaders(cfg, batch_size, num_workers=2, pin_memory=True, persistent_workers=True, prefetch_factor=2):
@@ -64,105 +65,83 @@ def create_qat_dataloaders(cfg, batch_size, num_workers=2, pin_memory=True, pers
 
 class HardwareConstrainedQuantizer(nn.Module):
     """Hardware quantizer using shared quantization.core functions for consistency with PTQ"""
-    
+
     def __init__(self, method: str = "linear", weight_bits: int = 8, activation_bits: int = 10,
-                 activation_max: float = 1024.0, log2_levels: int = 4,
-                 weight_min: float = -1.0, weight_max: float = 1.0):
+                 activation_min: float = 0.0, activation_max: float = 1024.0, log2_levels: int = 4,
+                 weight_min: float = -1.0, weight_max: float = 1.0, normalize_to_unit: bool = False):
         super().__init__()
         self.method = method
         self.weight_bits = weight_bits
         self.activation_bits = activation_bits
+        self.activation_min = activation_min
         self.activation_max = activation_max
         self.log2_levels = log2_levels
         self.weight_min = weight_min
         self.weight_max = weight_max
+        self.normalize_to_unit = normalize_to_unit
         self.enabled = True
-        
-        # Global quantization scale (computed using shared functions)
-        self.global_weight_scale = None
-        
-        # For linear quantization - use same parameters as quantization.core
+
+        # Global discrete quantization levels (computed later)
+        self.quantization_levels = None
+        self.lsb = None
+
+        # For linear quantization - use discrete levels instead of scale
         if method == "linear":
             self.weight_qmax = (1 << (weight_bits - 1)) - 1  # e.g., 7 for 4-bit
             self.weight_qmin = -self.weight_qmax
-        
-        # For log2 quantization  
-        elif method == "log2":
-            from quantization.core import compute_log2_levels
-            # Will compute levels dynamically based on data
+        # For log2 quantization: levels will be computed dynamically
     
-    def compute_global_scale(self, model: nn.Module) -> None:
-        """Compute global quantization scale using shared quantization.core functions"""
-        if self.method != "linear":
-            return  # Only needed for linear quantization
-            
-        # Collect all weight data (same as quantization.core global scheme)
-        all_weights = []
-        for name, param in model.named_parameters():
-            if 'weight' in name and param.dim() > 1:
-                w_clipped = torch.clamp(param, self.weight_min, self.weight_max)
-                all_weights.append(w_clipped.view(-1).detach())
-        
-        if all_weights:
-            all_weights_np = torch.cat(all_weights).cpu().numpy()
-            # Use same scale computation as quantization.core for consistency
-            self.global_weight_scale = compute_scale_symmetric(all_weights_np, self.weight_qmax, percentile=100.0)
-            global_max_abs = np.abs(all_weights_np).max()
-            print(f"[QAT] Global weight scale: {self.global_weight_scale:.6f} (max_abs: {global_max_abs:.6f})")
-        else:
-            self.global_weight_scale = 1.0
+    def compute_global_levels(self, model: nn.Module) -> None:
+        """Compute quantization parameters using quantization.core functions"""
+        if self.method == "linear":
+            num_levels = 2 ** self.weight_bits
+            self.qmax = qmax_for_bits(self.weight_bits)
+            self.qmin = -self.qmax
+            self.quantization_levels = np.linspace(self.weight_min, self.weight_max, num_levels, dtype=np.float32)
+            self.lsb = (self.weight_max - self.weight_min) / (num_levels - 1)
+            print(f"[QAT] Global quantization: {num_levels} discrete levels")
+            print(f"[QAT] Levels: [{self.weight_min:.6f} ... {self.weight_max:.6f}], LSB: {self.lsb:.6f}")
+            print(f"[QAT] First few levels: {self.quantization_levels[:5]}")
+            print(f"[QAT] Last few levels: {self.quantization_levels[-5:]}")
+        elif self.method == "log2":
+            # Will compute levels dynamically based on data
+            pass
     
     def quantize_weights(self, weights: torch.Tensor) -> torch.Tensor:
-        """Quantize weights using shared quantization.core functions for consistency"""
+        """Quantize weights using quantization.core functions"""
         if not self.enabled:
             return weights
-            
-        # First ensure weights are in [weight_min, weight_max] range (should be from clipping)
         w_clipped = torch.clamp(weights, self.weight_min, self.weight_max)
-        
         if self.method == "linear":
-            # Use global scale for consistent quantization across all layers
-            if self.global_weight_scale is None:
-                # Fallback - should not happen if compute_global_scale was called
-                self.global_weight_scale = 1.0
-            scale = self.global_weight_scale
-            
-            # Use shared quantization function for consistency with PTQ
-            w_quantized = quantize_tensor(
-                w_clipped, scale, zero_point=0, 
-                qmin=self.weight_qmin, qmax=self.weight_qmax, 
-                normalize_to_unit=False
-            )
-            
+            # Use symmetric quantization (zero_point=0)
+            scale = (self.weight_max - self.weight_min) / (2 * self.qmax)  # assumes symmetric grid
+            w_quantized = quantize_tensor(w_clipped, scale, 0, self.qmin, self.qmax, self.normalize_to_unit)
         elif self.method == "log2":
-            # Use quantization.core log2 functions for consistency
-            from quantization.core import quantize_to_log2
             w_np = w_clipped.cpu().numpy()
             max_abs = np.abs(w_np).max()
-            w_quantized_np = quantize_to_log2(w_np, self.log2_levels, max_abs, normalize_to_unit=False)
+            w_quantized_np = quantize_to_log2(w_np, self.log2_levels, max_abs, normalize_to_unit=self.normalize_to_unit)
             w_quantized = torch.from_numpy(w_quantized_np).to(weights.device)
-        
         else:
             raise ValueError(f"Unknown quantization method: {self.method}")
-        
         # Straight-through estimator
         return weights + (w_quantized - weights).detach()
     
     def quantize_activations(self, activations: torch.Tensor) -> torch.Tensor:
-        """Quantize activations to [0, activation_max] range"""
+        """Quantize activations to [activation_min, activation_max] range"""
         if not self.enabled:
             return activations
         
-        # Ensure activations are non-negative and within bounds
-        a_clipped = torch.clamp(activations, 0.0, self.activation_max)
+        # Ensure activations are within bounds
+        a_clipped = torch.clamp(activations, self.activation_min, self.activation_max)
         
         # Linear quantization for activations (always)
         act_qmax = (1 << self.activation_bits) - 1  # unsigned range [0, 2^n-1]
-        act_scale = self.activation_max / act_qmax
+        act_range = self.activation_max - self.activation_min
+        act_scale = act_range / act_qmax
         
-        q_codes = torch.round(a_clipped / act_scale)
+        q_codes = torch.round((a_clipped - self.activation_min) / act_scale)
         q_codes = torch.clamp(q_codes, 0, act_qmax)
-        a_quantized = q_codes * act_scale
+        a_quantized = q_codes * act_scale + self.activation_min
         
         # Straight-through estimator 
         return activations + (a_quantized - activations).detach()
@@ -239,6 +218,8 @@ def train_qat_simple(
     weight_clipping: bool = True,
     weight_min: float = -1.0,
     weight_max: float = 1.0,
+    act_min: float = 0.0,
+    act_max: float = 1024.0,
 ) -> Tuple[Dict[str, list], Dict[str, list]]:
     """Simple QAT training loop"""
     
@@ -298,7 +279,8 @@ def train_qat_simple(
         
         # Validation phase (with hardware constraints for consistent evaluation)
         val_loss, val_acc, val_prec, val_rec, val_f1 = evaluate_qat_simple(
-            model, val_loader, criterion, device, task_type, num_classes, apply_constraints=True
+            model, val_loader, criterion, device, task_type, num_classes, 
+            apply_constraints=True, act_min=act_min, act_max=act_max
         )
         val_hist["loss"].append(val_loss); val_hist["acc"].append(val_acc)
         val_hist["prec"].append(val_prec); val_hist["rec"].append(val_rec); val_hist["f1"].append(val_f1)
@@ -328,19 +310,21 @@ def evaluate_qat_simple(
     device: torch.device,
     task_type: str,
     num_classes: int,
-    apply_constraints: bool = True
+    apply_constraints: bool = True,
+    act_min: float = 0.0,
+    act_max: float = 1024.0
 ) -> Tuple[float, float, float, float, float]:
-    """Evaluation for QAT model with consistent constraint application"""
+    """Evaluation for QAT model with consistent constraint application matching PTQ"""
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
     tp = fp = fn = 0
     cm = [[0] * num_classes for _ in range(num_classes)] if task_type == "multiclass" else None
     
-    # Apply activation constraint hooks if requested (for fair comparison with hardware constraints)
+    # Apply activation constraint hooks if requested (matches PTQ evaluation)
     hooks = []
     if apply_constraints:
         def activation_constraint_hook(module, input, output):
-            return torch.clamp(output, 0.0, 1024.0)
+            return torch.clamp(output, act_min, act_max)
         
         # Apply hooks to modules with 'act' in name (matches PTQ evaluation)
         for name, module in model.named_modules():
@@ -355,12 +339,16 @@ def evaluate_qat_simple(
             else:
                 targets = batch_y.long().to(device)
             
-            # Apply input scaling for hardware constraints if requested
+            # Apply per-sample input scaling for hardware constraints (matches PTQ)
             if apply_constraints:
-                batch_min = batch_x.min()
-                batch_max = batch_x.max()
-                if batch_max > batch_min:
-                    batch_x = (batch_x - batch_min) / (batch_max - batch_min) * 1024.0
+                # Per-sample normalization to [act_min, act_max] using config limits
+                # Handles 2D (batch_size, features) and 3D (batch_size, features, time)
+                dims = tuple(range(1, batch_x.dim()))
+                min_vals = batch_x.amin(dim=dims, keepdim=True)
+                max_vals = batch_x.amax(dim=dims, keepdim=True)
+                denom = (max_vals - min_vals).clamp(min=1e-8)
+                # Scale to config activation range per input (same as PTQ)
+                batch_x = (batch_x - min_vals) / denom * (act_max - act_min) + act_min
             
             logits = model(batch_x)
             loss = criterion(logits, targets)
@@ -393,15 +381,15 @@ def evaluate_qat_simple(
 
 def export_hardware_weights(model: nn.Module, quantizer: HardwareConstrainedQuantizer, 
                            out_path: str) -> None:
-    """Export quantized weights for hardware deployment (use current training weights)"""
+    """Export quantized weights for hardware deployment (weights already quantized during training)"""
     hw_weights = {}
     
-    # Instead of re-quantizing, extract the current weights which are already
-    # quantized through the training process with straight-through estimators
+    # Apply final quantization to convert continuous training parameters to discrete hardware weights
+    # Straight-through estimator keeps parameters continuous - need final quantization for hardware
     for name, param in model.named_parameters():
         if 'weight' in name and param.dim() > 1:
             with torch.no_grad():
-                # Apply final quantization to ensure clean quantized values for deployment
+                # Apply the same quantization used during forward pass to get discrete values
                 w_clipped = torch.clamp(param.data, quantizer.weight_min, quantizer.weight_max)
                 w_quantized = quantizer.quantize_weights(w_clipped)
                 hw_weights[name] = w_quantized.detach().cpu().numpy()
@@ -410,9 +398,20 @@ def export_hardware_weights(model: nn.Module, quantizer: HardwareConstrainedQuan
     print(f"[OK] Exported hardware weights to {out_path}")
     
     # Report quantization stats
+    total_unique = set()
     for name, weights in hw_weights.items():
         unique_vals = np.unique(weights)
+        total_unique.update(unique_vals)
         print(f"  {name}: {len(unique_vals)} unique levels, range [{weights.min():.6f}, {weights.max():.6f}]")
+    
+    print(f"[GLOBAL] Total unique values across all layers: {len(total_unique)}")
+    if quantizer.method == "linear" and hasattr(quantizer, 'quantization_levels'):
+        expected_levels = len(quantizer.quantization_levels)
+        print(f"[GLOBAL] Expected {expected_levels} levels for {quantizer.weight_bits}-bit quantization")
+        if len(total_unique) == expected_levels:
+            print("[GLOBAL] ✓ Quantization successful - exact discrete levels achieved")
+        else:
+            print(f"[GLOBAL] ✗ Quantization issue - got {len(total_unique)} instead of {expected_levels} levels")
 
 
 def main():
@@ -445,10 +444,12 @@ def main():
     weight_min = args.weight_min if args.weight_min is not None else qat_cfg.get("weight_min", -1.0)
     weight_max = args.weight_max if args.weight_max is not None else qat_cfg.get("weight_max", 1.0)
     act_quantization_bits = args.act_quantization_bits if args.act_quantization_bits is not None else qat_cfg.get("act_quantization_bits", 10)
+    act_min = qat_cfg.get("act_min", 0.0)  # Get from config for consistency with PTQ
     act_max = args.act_max if args.act_max is not None else qat_cfg.get("act_max", 1024.0)
     epochs = args.epochs if args.epochs is not None else qat_cfg.get("num_epochs", 5)
     lr = args.lr if args.lr is not None else qat_cfg.get("learning_rate", 1e-4)
     batch_size = args.batch_size if args.batch_size is not None else qat_cfg.get("batch_size", 32)
+    normalize_to_unit = qat_cfg.get("normalize_to_unit", False)  # Get from config for consistency with PTQ
     
     # Device and dataloader settings
     device_cfg = qat_cfg.get("device", "auto")
@@ -463,7 +464,7 @@ def main():
     prefetch_factor = qat_cfg.get("prefetch_factor", 2)
     
     print(f"[QAT] Weight method: {weight_quantization_method}, Weight bits: {weight_linear_quantization_bits}, "
-          f"Act bits: {act_quantization_bits}, Act max: {act_max}, Weight range: [{weight_min}, {weight_max}]")
+          f"Act bits: {act_quantization_bits}, Act range: [{act_min}, {act_max}], Weight range: [{weight_min}, {weight_max}]")
     print(f"[QAT] Device: {device}, Workers: {num_workers}, Pin memory: {pin_memory}")
     
     # Create datasets
@@ -486,14 +487,16 @@ def main():
         method=weight_quantization_method,
         weight_bits=weight_linear_quantization_bits,
         activation_bits=act_quantization_bits,
+        activation_min=act_min,
         activation_max=act_max,
         log2_levels=weight_log2_quantization_num_levels,
         weight_min=weight_min,
-        weight_max=weight_max
+        weight_max=weight_max,
+        normalize_to_unit=normalize_to_unit
     )
     
-    # Compute global quantization scale before applying QAT
-    quantizer.compute_global_scale(model)
+    # Compute global quantization levels before applying QAT
+    quantizer.compute_global_levels(model)
     
     # Apply QAT
     model = apply_hardware_qat(model, quantizer)
@@ -502,21 +505,31 @@ def main():
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss() if task_type == "multiclass" else nn.BCEWithLogitsLoss()
     
+    # Evaluate initial quantized model (before any QAT training)
+    print(f"[QAT] Evaluating initial quantized model on validation set...")
+    initial_val_loss, initial_val_acc, initial_val_prec, initial_val_rec, initial_val_f1 = evaluate_qat_simple(
+        model, val_loader, criterion, device, task_type, num_classes, 
+        apply_constraints=True, act_min=act_min, act_max=act_max
+    )
+    print(f"[Initial] Val: Loss={initial_val_loss:.4f} Acc={initial_val_acc:.4f} "
+          f"Prec={initial_val_prec:.4f} Rec={initial_val_rec:.4f} F1={initial_val_f1:.4f}")
+    
     print(f"[QAT] Starting training for {epochs} epochs...")
     train_hist, val_hist = train_qat_simple(
         model, quantizer, train_loader, val_loader, optimizer, criterion,
         device, epochs, task_type, num_classes, weight_clipping=True,
-        weight_min=weight_min, weight_max=weight_max
+        weight_min=weight_min, weight_max=weight_max, act_min=act_min, act_max=act_max
     )
     
     # Test evaluation (with hardware constraints for consistent evaluation)
     test_loss, test_acc, test_prec, test_rec, test_f1 = evaluate_qat_simple(
-        model, test_loader, criterion, device, task_type, num_classes, apply_constraints=True
+        model, test_loader, criterion, device, task_type, num_classes, 
+        apply_constraints=True, act_min=act_min, act_max=act_max
     )
     print(f"[TEST] Loss: {test_loss:.4f} Acc: {test_acc:.4f} F1: {test_f1:.4f}")
     
     # Save metrics and plots
-    plots_dir = os.path.join(cfg["output"]["plots_dir"], "training")
+    plots_dir = os.path.join(cfg["output"]["plots_dir"], "qat/training")
     os.makedirs(plots_dir, exist_ok=True)
     
     # Save training metrics plot
@@ -540,10 +553,10 @@ def main():
     output_dir = os.path.join(cfg["output"]["weights_dir"], "qat")
     os.makedirs(output_dir, exist_ok=True)
     
-    model_path = os.path.join(output_dir, f"qat_simple_{weight_quantization_method}_{weight_linear_quantization_bits}bit.pt")
+    model_path = os.path.join(output_dir, f"qat_weights_{weight_quantization_method}_{weight_linear_quantization_bits}bit_act_{act_quantization_bits}bit.pt")
     torch.save(model.state_dict(), model_path)
     
-    weights_path = os.path.join(output_dir, f"qat_simple_{weight_quantization_method}_{weight_linear_quantization_bits}bit.npz")
+    weights_path = os.path.join(output_dir, f"qat_weights_{weight_quantization_method}_{weight_linear_quantization_bits}bit_act_{act_quantization_bits}bit.npz")
     export_hardware_weights(model, quantizer, weights_path)
     
     print(f"[DONE] QAT training completed. Model saved to {model_path}")

@@ -111,7 +111,7 @@ class KeywordModel:
         
         Args:
             cfg_path: Path to config YAML file
-            weights_path: Path to model weights (.pt file)
+            weights_path: Path to model weights (.pt or .npz file)
             device: torch.device for inference
         """
         self.cfg = load_config(cfg_path)

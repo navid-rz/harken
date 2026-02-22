@@ -4,138 +4,83 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 from torch.utils.data import ConcatDataset, DataLoader, Subset
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 import numpy as np
 from copy import deepcopy
 import tempfile
 
 from config import load_config
-from inference.model import KeywordModel
 from data_loader.utils import make_datasets
-from quantization.core import quantize_model_weights, quantize_to_log2
+from quantization.core import quantize_model_weights
 from tqdm import tqdm
 
 
-def apply_log2_quantization(model: nn.Module, num_levels: int, global_percentile: float = 100.0, 
-                           normalize_to_unit: bool = False) -> nn.Module:
+def apply_quantization(model: nn.Module, method: str, weight_min: float, weight_max: float,
+                      bits: int = None, num_levels: int = None,
+                      global_percentile: float = 100.0, normalize_to_unit: bool = False) -> nn.Module:
     """
-    Apply log2 quantization to model weights using global scaling.
-    
-    Args:
-        model: PyTorch model to quantize  
-        num_levels: Number of log2 levels (creates range ±2^num_levels)
-        global_percentile: Percentile for global max computation
-        normalize_to_unit: If True, normalize to [-1,+1] for hardware deployment
-        
-    Returns:
-        New model with log2 quantized weights
-    """
-    model_q = deepcopy(model)
-    original_device = next(model_q.parameters()).device  # Store original device
-    
-    # Collect all weight parameters for global percentile computation
-    all_weights = []
-    for module in model_q.modules():
-        if isinstance(module, (nn.Conv1d, nn.Linear)):
-            all_weights.append(module.weight.data.cpu().numpy().flatten())
-    
-    if not all_weights:
-        return model_q
-        
-    # Compute global percentile across all weights
-    all_weights_flat = np.concatenate(all_weights)
-    global_max = np.percentile(np.abs(all_weights_flat), global_percentile)
-    
-    print(f"[LOG2 QUANTIZATION DEBUG] normalize_to_unit={normalize_to_unit}")
-    print(f"  Original weights: min={all_weights_flat.min():.6f}, max={all_weights_flat.max():.6f}")
-    print(f"  Global max (percentile): {global_max:.6f}")
-    
-    # Apply log2 quantization to each layer using global max
-    quantized_weights = []
-    for module in model_q.modules():
-        if isinstance(module, (nn.Conv1d, nn.Linear)):
-            w_np = module.weight.data.cpu().numpy()
-            w_quantized = quantize_to_log2(w_np, num_levels, global_max, normalize_to_unit)
-            module.weight.data = torch.from_numpy(w_quantized).float().to(module.weight.device)
-            quantized_weights.append(w_quantized.flatten())
-    
-    if quantized_weights:
-        all_quantized = np.concatenate(quantized_weights)
-        print(f"  Quantized weights: min={all_quantized.min():.6f}, max={all_quantized.max():.6f}")
-        unique_values = np.unique(all_quantized)
-        print(f"  Unique quantized values: {len(unique_values)} values")
-        print(f"  Sample values: {unique_values[:10]}")
-    
-    # Move model back to original device
-    model_q = model_q.to(original_device)        
-    return model_q
-
-
-def apply_linear_quantization(model: nn.Module, weight_bits: int, global_percentile: float = 100.0,
-                             normalize_to_unit: bool = False) -> nn.Module:
-    """
-    Apply linear quantization to model weights using global scaling.
+    Apply weight quantization to model using quantization.core with config-specified limits.
     
     Args:
         model: PyTorch model to quantize
-        weight_bits: Number of bits for linear quantization
+        method: Quantization method - "linear" or "log2"
+        weight_min: Minimum weight value from config (e.g., -1.0)
+        weight_max: Maximum weight value from config (e.g., 1.0)
+        bits: Number of bits for linear quantization (required if method="linear")
+        num_levels: Number of levels for log2 quantization (required if method="log2")
         global_percentile: Percentile for global max computation
         normalize_to_unit: If True, normalize to [-1,+1] for hardware deployment
         
     Returns:
-        New model with linear quantized weights
+        New model with quantized weights
     """
     model_q = deepcopy(model)
-    original_device = next(model_q.parameters()).device  # Store original device
+    original_device = next(model_q.parameters()).device
     
-    # Collect original weight stats
-    all_weights = []
-    for module in model_q.modules():
-        if isinstance(module, (nn.Conv1d, nn.Linear)):
-            all_weights.append(module.weight.data.cpu().numpy().flatten())
+    # Apply quantization using unified quantization.core interface
+    if method == "linear":
+        quantized_model = quantize_model_weights(
+            model_q,
+            method="linear",
+            bits=bits,
+            scheme="global",
+            symmetric=True,
+            global_percentile=global_percentile,
+            normalize_to_unit=normalize_to_unit
+        )
+    elif method == "log2":
+        quantized_model = quantize_model_weights(
+            model_q,
+            method="log2",
+            num_log2_levels=num_levels,
+            scheme="global",
+            global_percentile=global_percentile,
+            normalize_to_unit=normalize_to_unit
+        )
+    else:
+        raise ValueError(f"Unknown quantization method: {method}")
     
-    if all_weights:
-        all_weights_orig = np.concatenate(all_weights)
-        print(f"[LINEAR QUANTIZATION DEBUG] normalize_to_unit={normalize_to_unit}")
-        print(f"  Original weights: min={all_weights_orig.min():.6f}, max={all_weights_orig.max():.6f}")
-    
-    # Use global quantization scheme for hardware-consistent evaluation (matches QAT)
-    quantized_model = quantize_model_weights(
-        model_q, 
-        bits=weight_bits,
-        scheme="global",  # Use global scheme to match QAT global scale approach
-        symmetric=True,
-        global_percentile=global_percentile,
-        normalize_to_unit=normalize_to_unit
-    )
-    
-    # Check quantized weight stats
-    quantized_weights = []
+    # Apply config weight limits after quantization
     for module in quantized_model.modules():
-        if isinstance(module, (nn.Conv1d, nn.Linear)):
-            quantized_weights.append(module.weight.data.cpu().numpy().flatten())
+        if isinstance(module, (nn.Conv1d, nn.Linear)) and hasattr(module, 'weight'):
+            module.weight.data = torch.clamp(module.weight.data, weight_min, weight_max)
     
-    if quantized_weights:
-        all_quantized = np.concatenate(quantized_weights)
-        print(f"  Quantized weights: min={all_quantized.min():.6f}, max={all_quantized.max():.6f}")
-        unique_values = np.unique(all_quantized)
-        print(f"  Unique quantized values: {len(unique_values)} values")
-        print(f"  Sample values: {unique_values[:10]}")
-    
-    # Move model back to original device
-    quantized_model = quantized_model.to(original_device)
-    return quantized_model
+    return quantized_model.to(original_device)
 
 
-def evaluate_model_consistent(model: nn.Module, loader: DataLoader, device: torch.device, 
+def evaluate_model_consistent(model: nn.Module, loader: DataLoader, device: torch.device,
+                             act_min: float = 0.0, act_max: float = 1024.0,
                              apply_constraints: bool = True, verbose: bool = False) -> Dict[str, float]:
     """
     Consistent model evaluation with same protocol as QAT training.
+    Uses config-specified activation limits for proper scaling.
     
     Args:
         model: Model to evaluate
         loader: DataLoader for evaluation
         device: Device to run evaluation on
+        act_min: Minimum activation value from config (e.g., 0.0)
+        act_max: Maximum activation value from config (e.g., 1024.0)
         apply_constraints: Whether to apply hardware constraints (activation clipping, input scaling)
         verbose: Whether to show progress bar
         
@@ -144,11 +89,11 @@ def evaluate_model_consistent(model: nn.Module, loader: DataLoader, device: torc
     """
     model.eval()
     
-    # Apply activation constraint hooks if requested
+    # Apply activation constraint hooks if requested using config limits
     hooks = []
     if apply_constraints:
         def activation_constraint_hook(module, input, output):
-            return torch.clamp(output, 0.0, 1024.0)
+            return torch.clamp(output, act_min, act_max)
         
         # Apply hooks to modules with 'act' in name (matches controlled test)
         for name, module in model.named_modules():
@@ -167,12 +112,16 @@ def evaluate_model_consistent(model: nn.Module, loader: DataLoader, device: torc
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
             
-            # Apply input scaling for hardware constraints if requested
+            # Apply per-input scaling for hardware constraints if requested
             if apply_constraints:
-                batch_min = batch_x.min()
-                batch_max = batch_x.max()
-                if batch_max > batch_min:
-                    batch_x = (batch_x - batch_min) / (batch_x.max() - batch_x.min()) * 1024.0
+                # Per-sample normalization to [act_min, act_max] using config limits
+                # Handles 2D (batch_size, features) and 3D (batch_size, features, time)
+                dims = tuple(range(1, batch_x.dim()))
+                min_vals = batch_x.amin(dim=dims, keepdim=True)
+                max_vals = batch_x.amax(dim=dims, keepdim=True)
+                denom = (max_vals - min_vals).clamp(min=1e-8)
+                # Scale to config activation range per input
+                batch_x = (batch_x - min_vals) / denom * (act_max - act_min) + act_min
             
             outputs = model(batch_x)
             preds = torch.argmax(outputs, dim=1)
@@ -270,9 +219,22 @@ def main() -> None:
     else:
         device = torch.device(args.device)
     
+    # Extract training limits from config (train section only)
+    train_cfg = cfg.get("train", {})
+    
+    # Weight limits from train section only
+    weight_min = train_cfg.get("weight_min", -1.0)
+    weight_max = train_cfg.get("weight_max", 1.0)
+    
+    # Activation limits from train section only
+    act_min = train_cfg.get("act_min", 0.0)
+    act_max = train_cfg.get("act_max", 1024.0)
+    
     print(f"Using device: {device}")
     print(f"Config: {args.config}")
     print(f"Weights: {args.weights}")
+    print(f"Weight limits from train config: [{weight_min}, {weight_max}]")
+    print(f"Activation limits from train config: [{act_min}, {act_max}]")
 
     # Create evaluation DataLoader
     train_loader, val_loader, test_loader = make_datasets(cfg, which="all", batch_size=args.batch_size)
@@ -310,8 +272,9 @@ def main() -> None:
         original_model.load_state_dict(checkpoint, strict=False)
         original_model = original_model.to(device).eval()
         
-        # Evaluate original model with consistent protocol
-        original_metrics = evaluate_model_consistent(original_model, eval_loader, device, verbose=args.verbose)
+        # Evaluate original model with consistent protocol using config limits
+        original_metrics = evaluate_model_consistent(original_model, eval_loader, device, 
+                                                   act_min=act_min, act_max=act_max, verbose=args.verbose)
         print(f"Original: Acc={original_metrics['accuracy']:.4f} "
               f"P={original_metrics['precision']:.4f} R={original_metrics['recall']:.4f} "
               f"F1={original_metrics['f1']:.4f}")
@@ -333,17 +296,21 @@ def main() -> None:
                 bits = int(bits_str)
                 print(f"\nLinear {bits}-bit quantization...")
                 
-                # Apply linear quantization to original model
-                model_linear = apply_linear_quantization(
-                    original_model, 
-                    weight_bits=bits,
+                # Apply linear quantization to original model using config limits
+                model_linear = apply_quantization(
+                    original_model,
+                    method="linear",
+                    bits=bits,
+                    weight_min=weight_min,
+                    weight_max=weight_max,
                     global_percentile=args.global_percentile,
                     normalize_to_unit=args.normalize_to_unit
                 )
                 model_linear = model_linear.to(device)  # Ensure model is on correct device
                 
-                # Evaluate quantized model with same protocol as QAT
+                # Evaluate quantized model with same protocol as QAT using config limits
                 linear_metrics = evaluate_model_consistent(model_linear, eval_loader, device, 
+                                                          act_min=act_min, act_max=act_max,
                                                           apply_constraints=True, verbose=args.verbose)
                 results.append(("linear", f"{bits}bit", linear_metrics))
                 
@@ -361,17 +328,21 @@ def main() -> None:
                 levels = int(levels_str)
                 print(f"\nLog2 {levels}-level quantization...")
                 
-                # Apply log2 quantization to original model
-                model_log2 = apply_log2_quantization(
+                # Apply log2 quantization to original model using config limits
+                model_log2 = apply_quantization(
                     original_model,
+                    method="log2",
                     num_levels=levels,
+                    weight_min=weight_min,
+                    weight_max=weight_max,
                     global_percentile=args.global_percentile,
                     normalize_to_unit=args.normalize_to_unit
                 )
                 model_log2 = model_log2.to(device)  # Ensure model is on correct device
                 
-                # Evaluate quantized model with same protocol as QAT
+                # Evaluate quantized model with same protocol as QAT using config limits
                 log2_metrics = evaluate_model_consistent(model_log2, eval_loader, device, 
+                                                        act_min=act_min, act_max=act_max,
                                                         apply_constraints=True, verbose=args.verbose)
                 results.append(("log2", f"{levels}lvl", log2_metrics))
                 
@@ -475,7 +446,7 @@ def main() -> None:
     plt.tight_layout()
     
     # Save plot
-    plot_filename = f"quantization_eval_{model_name}_{args.dataset}"
+    plot_filename = f"quantization_eval_{model_name}_{args.dataset}_{args.quant_method}"
     if args.subset_size:
         plot_filename += f"_subset{args.subset_size}"
     plot_filename += ".png"

@@ -22,10 +22,8 @@ def try_extract_items(npz):
     for k in npz.files:
         if 'weight' in k and not k.endswith('.q') and not k.endswith('.scale'):
             weight_data = np.array(npz[k])
-            # Check if this looks like quantized weights (limited unique values)
-            unique_vals = len(np.unique(weight_data))
-            if unique_vals <= 32:  # Probably quantized (up to 5-bit)
-                qat_items.append((k, weight_data, None))
+            # Always include weight tensors from .npz files (they're intended to be quantized)
+            qat_items.append((k, weight_data, None))
     
     if qat_items:
         print(f"[INFO] Detected QAT format: {len(qat_items)} quantized weight tensors")
@@ -71,7 +69,7 @@ def plot_hist_weights(name, q, weight_hist_dir, qmin=None, qmax=None, annotate_c
             zeros = int((flat == 0).sum())
             nonzeros = total - zeros
             weight_min, weight_max = flat.min(), flat.max()
-            txt = f"total = {total:,}\\nnon-zero = {nonzeros:,}\\nzeros = {zeros:,}\\nunique = {len(unique_vals)}\\nrange = [{weight_min:.6f}, {weight_max:.6f}]"
+            txt = f"total = {total:,}\nnon-zero = {nonzeros:,}\nzeros = {zeros:,}\nunique = {len(unique_vals)}\nrange = [{weight_min:.6f}, {weight_max:.6f}]"
             ax = plt.gca()
             ax.text(
                 0.98, 0.95, txt,
@@ -102,7 +100,7 @@ def plot_hist_weights(name, q, weight_hist_dir, qmin=None, qmax=None, annotate_c
             zeros = int((flat == 0).sum())
             nonzeros = total - zeros
             weight_min, weight_max = flat.min(), flat.max()
-            txt = f"total = {total:,}\\nnon-zero = {nonzeros:,}\\nzeros = {zeros:,}\\nunique = {len(unique_vals)}\\nrange = [{weight_min:.6f}, {weight_max:.6f}]"
+            txt = f"total = {total:,}\nnon-zero = {nonzeros:,}\nzeros = {zeros:,}\nunique = {len(unique_vals)}\nrange = [{weight_min:.6f}, {weight_max:.6f}]"
             ax = plt.gca()
             ax.text(
                 0.98, 0.95, txt,

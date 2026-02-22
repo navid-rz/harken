@@ -440,7 +440,7 @@ def plot_multi_quant_histograms(
             edges = np.array(edges)
             title_suffix = f"log2-{log2_levels}lvl ({scheme})"
         else:
-            # Original linear quantization (restore exact original logic)
+            # Linear quantization
             qmax = qmax_for_bits(b)
             q_codes = quantize_weights_by_scheme(
                 state_dict=state_dict,
@@ -448,6 +448,7 @@ def plot_multi_quant_histograms(
                 scheme=scheme,
                 global_percentile=global_percentile,
                 return_codes=True,
+                method="linear",
                 normalize_to_unit=normalize_to_unit
             )
             edges = np.arange(-qmax - 0.5, qmax + 1.5, 1.0)

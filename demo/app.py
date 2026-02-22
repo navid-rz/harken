@@ -421,7 +421,7 @@ class App:
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
-    ap.add_argument("--weights", required=True)
+    ap.add_argument("--weights", required=True, help="Path to model weights (.pt or .npz file)")
     ap.add_argument("--device", choices=["cpu","cuda","auto"], default="auto")
     return ap.parse_args()
 
